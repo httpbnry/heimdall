@@ -31,6 +31,8 @@ readonly NC='\033[0m' # No Color
 
 # Contadores globales
 TOTAL=0
+UNICAS=0
+DUPLICADAS=0
 COMPROMISED=0
 ERRORS=0
 REPORT_LINES=()
@@ -194,7 +196,8 @@ save_report() {
 # ── Main ───────────────────────────────────────────────────────────────────
 
 main() {
-    local txt_output="" accounts line email password result status hash ocurrencias
+    local txt_output="" accounts line email password result status hash ocurrencias pass_hash
+    local -A cache
 
     # Parsear argumentos
     while [[ $# -gt 0 ]]; do
@@ -224,26 +227,44 @@ main() {
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
 
-        # Saltar líneas que no tengan formato email:password
         if [[ "$line" != *@*:* ]]; then
             log "${YELLOW}WARN${NC}" "Línea ignorada (formato inesperado): ${line:0:80}"
             continue
         fi
 
-        # Extraer email y password
         email="${line%%:*}"
         password="${line#*:}"
-
-        # Quitar posibles espacios alrededor
         email=$(echo "$email" | xargs)
         password=$(echo "$password" | xargs)
 
         ((i++))
         printf "  [%d/%d] %-40s " "$i" "$TOTAL" "$email"
 
-        result=$(check_hibp "$password") || true
+        # Cache por hash SHA-1
+        pass_hash=$(sha1_hex "$password")
 
-        # Parsear resultado: STATUS|HASH|COUNT
+        if [[ -n "${cache[$pass_hash]:-}" ]]; then
+            ((DUPLICADAS++))
+            result="${cache[$pass_hash]}"
+            status="${result%%|*}"
+            ocurrencias="${result##*|}"
+            hash="${result#*|}"; hash="${hash%%|*}"
+
+            if [[ "$status" == "COMPROMISED" ]]; then
+                ((COMPROMISED++))
+                echo -e "${YELLOW}[DUPLICADA]${NC} ${RED}(filtrada ${ocurrencias}x)${NC}"
+                REPORT_LINES+=("COMPROMISED|${email}|${hash}|${ocurrencias}")
+            else
+                echo -e "${YELLOW}[DUPLICADA]${NC}"
+                REPORT_LINES+=("SAFE|${email}|${hash}|0")
+            fi
+            continue
+        fi
+
+        ((UNICAS++))
+        result=$(check_hibp "$password") || true
+        cache["$pass_hash"]="$result"
+
         status="${result%%|*}"
         rest="${result#*|}"
         hash="${rest%%|*}"
@@ -251,7 +272,7 @@ main() {
 
         case "$status" in
             COMPROMISED)
-                echo -e "${RED}[COMPROMISIDA] (filtrada ${ocurrencias}x)${NC}"
+                echo -e "${RED}[COMPROMETIDA] (filtrada ${ocurrencias}x)${NC}"
                 ((COMPROMISED++))
                 REPORT_LINES+=("COMPROMISED|${email}|${hash}|${ocurrencias}")
                 ;;
@@ -268,18 +289,18 @@ main() {
 
     done <<< "$accounts"
 
-    # Resumen
     local safe=$(( TOTAL - COMPROMISED - ERRORS ))
     echo ""
     echo -e "  ${BOLD}==================================================${NC}"
     echo -e "   Total          : ${TOTAL}"
+    echo -e "   Únicas         : ${UNICAS}"
+    echo -e "   Duplicadas     : ${DUPLICADAS} (omitidas de API)"
     echo -e "   Seguras        : ${GREEN}${safe}${NC}"
     echo -e "   Comprometidas  : ${RED}${COMPROMISED}${NC}"
     echo -e "   Errores        : ${YELLOW}${ERRORS}${NC}"
     echo -e "  ${BOLD}==================================================${NC}"
     echo ""
 
-    # Guardar reporte si se indicó
     if [[ -n "$txt_output" ]]; then
         save_report "$txt_output"
     fi

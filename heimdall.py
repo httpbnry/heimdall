@@ -179,7 +179,8 @@ def guardar_reporte_txt(reporte: list[dict], ruta: str):
 
 
 def run_audit(cfg: dict, txt_output: str = "") -> int:
-    stats = {"total": 0, "comprometidas": 0, "errores": 0}
+    stats = {"total": 0, "unicas": 0, "duplicadas": 0, "comprometidas": 0, "errores": 0}
+    cache: dict[str, dict] = {}
     reporte = []
 
     print(f"\n{COLOR_CYAN}╔════════════════════════════════════╗{COLOR_RESET}")
@@ -202,8 +203,28 @@ def run_audit(cfg: dict, txt_output: str = "") -> int:
     for i, acct in enumerate(accounts, 1):
         email = acct["email"]
         password = acct["password"]
+        pass_hash = _sha1_hex(password)
 
         print(f"  [{i}/{len(accounts)}] {email:<40} ", end="", flush=True)
+
+        if pass_hash in cache:
+            stats["duplicadas"] += 1
+            result = cache[pass_hash]
+            print(f"{COLOR_YELLOW}[DUPLICADA]{COLOR_RESET} ", end="")
+            if result["compromised"]:
+                stats["comprometidas"] += 1
+                print(f"{COLOR_RED}(filtrada {result['occurrences']}x){COLOR_RESET}")
+            else:
+                print()
+            reporte.append({
+                "email": email, "hash": result["hash"],
+                "comprometida": result["compromised"],
+                "ocurrencias": result.get("occurrences", 0),
+                "error": result.get("error"),
+            })
+            continue
+
+        stats["unicas"] += 1
 
         try:
             result = check_password_hibp(password, cfg["hibp_rate_limit"])
@@ -215,7 +236,10 @@ def run_audit(cfg: dict, txt_output: str = "") -> int:
                 "email": email, "hash": "", "comprometida": False,
                 "ocurrencias": 0, "error": str(e),
             })
+            cache[pass_hash] = {"compromised": False, "occurrences": 0, "hash": "", "error": str(e)}
             continue
+
+        cache[pass_hash] = result
 
         if result.get("error"):
             stats["errores"] += 1
@@ -235,8 +259,11 @@ def run_audit(cfg: dict, txt_output: str = "") -> int:
         })
 
     seguras = stats["total"] - stats["comprometidas"] - stats["errores"]
+    ahorradas = stats["duplicadas"]
     print(f"\n{'=' * 50}")
     print(f"  Total          : {stats['total']}")
+    print(f"  Únicas         : {stats['unicas']}")
+    print(f"  Duplicadas     : {ahorradas} (omitidas de API)")
     print(f"  Seguras        : {COLOR_GREEN}{seguras}{COLOR_RESET}")
     print(f"  Comprometidas  : {COLOR_RED}{stats['comprometidas']}{COLOR_RESET}")
     print(f"  Errores        : {COLOR_YELLOW}{stats['errores']}{COLOR_RESET}")
