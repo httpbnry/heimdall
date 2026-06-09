@@ -21,10 +21,11 @@ usage() {
     echo -e "${BOLD}Heimdall.sh${NC} v${VERSION} — Plesk Password Auditor"
     echo ""
     echo -e "${BOLD}Uso:${NC}"
-    echo -e "  $(basename "$0")                         Auditoría en vivo"
-    echo -e "  $(basename "$0") --txt <archivo>         + reporte .txt"
-    echo -e "  $(basename "$0") --dry-run               Solo consola"
-    echo -e "  $(basename "$0") -h                      Ayuda"
+    echo -e "  $(basename "$0")                              Auditoría en vivo"
+    echo -e "  $(basename "$0") --txt <archivo>              + reporte .txt"
+    echo -e "  $(basename "$0") --from-file cuentas.txt      Desde archivo plano"
+    echo -e "  $(basename "$0") --dry-run                    Solo consola"
+    echo -e "  $(basename "$0") -h                           Ayuda"
     exit 0
 }
 
@@ -45,7 +46,7 @@ sha1_hex() {
 
 fetch_prefix() {
     sleep "$RATE_LIMIT"
-    curl -sS --max-time "$HIBP_TIMEOUT" \
+    curl -sS --max-time "$HIBP_TIMEOUT" --connect-timeout 5 \
          -A "Heimdall-Plesk-Auditor/${VERSION}" \
          "${HIBP_API_URL}${1}" 2>/dev/null || echo ""
 }
@@ -62,35 +63,50 @@ print_banner() {
 
 
 main() {
-    local txt_output="" prefix suffix email password hash line
+    local txt_output="" from_file="" prefix suffix email password hash line
     local total_prefixes prefix_count=0 total=0 unicas=0 comp=0 errs=0 duplicados=0
     local hash_file report_file cur_prefix
 
     while [[ $# -gt 0 ]]; do
         case "$1" in -h|--help) usage ;;
             --txt) txt_output="$2"; shift 2 ;;
+            --from-file) from_file="$2"; shift 2 ;;
             --dry-run) txt_output=""; shift ;;
             *) die "Opción: $1" ;;
         esac
     done
 
     print_banner
-    [[ -x "$MAIL_AUTH_VIEW" ]] || die "No encontrado: $MAIL_AUTH_VIEW"
 
     hash_file=$(mktemp); report_file=$(mktemp)
     trap "rm -f $hash_file $report_file" EXIT
 
-    # Fase 1: extraer cuentas y calcular hash SHA-1
-    while IFS= read -r line; do
-        [[ -z "$line" || "$line" != *@*:* ]] && continue
-        email="${line%%:*}"
-        password="${line#*:}"
-        email=$(echo "$email" | xargs)
-        password=$(echo "$password" | xargs)
-        [[ -z "$password" ]] && continue
-        hash=$(sha1_hex "$password")
-        echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
-    done < <("$MAIL_AUTH_VIEW" 2>/dev/null || die "$MAIL_AUTH_VIEW falló")
+    # Fase 1: extraer cuentas
+    if [[ -n "$from_file" ]]; then
+        [[ -f "$from_file" ]] || die "Archivo no encontrado: $from_file"
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == "#"* || "$line" != *@*:* ]] && continue
+            email="${line%%:*}"
+            password="${line#*:}"
+            email=$(echo "$email" | xargs)
+            password=$(echo "$password" | xargs)
+            [[ -z "$password" ]] && continue
+            hash=$(sha1_hex "$password")
+            echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
+        done < "$from_file"
+    else
+        [[ -x "$MAIL_AUTH_VIEW" ]] || die "No encontrado: $MAIL_AUTH_VIEW. Usa --from-file como alternativa."
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" != *@*:* ]] && continue
+            email="${line%%:*}"
+            password="${line#*:}"
+            email=$(echo "$email" | xargs)
+            password=$(echo "$password" | xargs)
+            [[ -z "$password" ]] && continue
+            hash=$(sha1_hex "$password")
+            echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
+        done < <("$MAIL_AUTH_VIEW" 2>/dev/null || die "$MAIL_AUTH_VIEW falló")
+    fi
 
     total=$(wc -l < "$hash_file")
     [[ "$total" -eq 0 ]] && { echo -e "  ${YELLOW}Sin cuentas.${NC}\n"; exit 0; }
@@ -108,64 +124,54 @@ main() {
     echo -e "  Cuentas: ${BOLD}${total}${NC} | Únicas: ${BOLD}${unicas}${NC} | Prefijos: ${BOLD}${total_prefixes}${NC} | Ahorro: ${GREEN}$(( duplicados + (unicas - total_prefixes) )) llamadas${NC}"
     echo ""
 
-    cur_prefix=""
+    # Fase 2: agrupar por prefijo y procesar cada grupo
     prefix_count=0
-    # Variables para acumular entradas del prefijo actual
-    declare -a cur_emails=()
-    declare -a cur_suffixes=()
+    while IFS= read -r prefix; do
+        [[ -z "$prefix" ]] && continue
+        prefix_count=$(( prefix_count + 1 ))
 
-    flush_prefix() {
-        local resp s count_line srv c found
-        [[ -z "$cur_prefix" ]] && return
-        ((prefix_count++))
-        printf "  [%d/%d] Prefijo %s (%d pwd) ... " "$prefix_count" "$total_prefixes" "$cur_prefix" "${#cur_suffixes[@]}"
+        # Obtener entradas de este prefijo
+        local entries buf
+        entries=$(grep "^${prefix}|" "$dedup_file" || true)
 
-        resp=$(fetch_prefix "$cur_prefix")
-        if [[ -z "$resp" ]]; then
+        # Arrays locales
+        local -a emails=() suffixes=()
+        while IFS='|' read -r _ s e; do
+            suffixes+=("$s"); emails+=("$e")
+        done <<< "$entries"
+        [[ "${#emails[@]}" -eq 0 ]] && continue
+
+        printf "  [%d/%d] Prefijo %s (%d pwd) ... " \
+               "$prefix_count" "$total_prefixes" "$prefix" "${#suffixes[@]}"
+
+        buf=$(fetch_prefix "$prefix") || true
+        if [[ -z "$buf" ]]; then
             echo -e "${RED}ERROR${NC}"
-            for i in "${!cur_suffixes[@]}"; do
-                echo "ERROR|${cur_emails[$i]}|${cur_prefix}${cur_suffixes[$i]}" >> "$report_file"
-                ((errs++))
+            for i in "${!emails[@]}"; do
+                echo "ERROR|${emails[$i]}|${prefix}${suffixes[$i]}" >> "$report_file"
+                errs=$(( errs + 1 ))
             done
-            return
+            continue
         fi
         echo -e "${GREEN}OK${NC}"
 
-        # Construir array asociativo de comprometidos
-        declare -A cmap
+        # Construir mapa de sufijos (global dentro de main)
+        unset __cmap 2>/dev/null || true; declare -A __cmap
         while IFS=: read -r s c; do
             s=$(echo "$s" | tr 'a-f' 'A-F' | xargs)
-            cmap["$s"]="$c"
-        done <<< "$resp"
+            __cmap["$s"]="$c"
+        done <<< "$buf"
 
-        for i in "${!cur_suffixes[@]}"; do
-            s="${cur_suffixes[$i]}"
-            e="${cur_emails[$i]}"
-            if [[ -n "${cmap[$s]:-}" ]]; then
-                echo "COMPROMISED|$e|${cur_prefix}${s}|${cmap[$s]}" >> "$report_file"
-                ((comp++))
+        for i in "${!emails[@]}"; do
+            s="${suffixes[$i]}"; e="${emails[$i]}"
+            if [[ -n "${__cmap[$s]:-}" ]]; then
+                echo "COMPROMISED|${e}|${prefix}${s}|${__cmap[$s]}" >> "$report_file"
+                comp=$(( comp + 1 ))
             else
-                echo "SAFE|$e|${cur_prefix}${s}|0" >> "$report_file"
+                echo "SAFE|${e}|${prefix}${s}|0" >> "$report_file"
             fi
         done
-
-        cur_prefix=""
-        cur_emails=()
-        cur_suffixes=()
-    }
-
-    # Procesar líneas ordenadas por prefijo
-    while IFS='|' read -r prefix suffix email; do
-        if [[ "$prefix" != "$cur_prefix" && -n "$cur_prefix" ]]; then
-            flush_prefix
-        fi
-        cur_prefix="$prefix"
-        cur_emails+=("$email")
-        cur_suffixes+=("$suffix")
-    done < <(sort -t'|' -k1,1 -k2,2 "$dedup_file")
-
-    # Último prefijo
-    flush_prefix
+    done < <(cut -d'|' -f1 "$dedup_file" | sort -u)
 
     # Resumen
     safe=$(( total - comp - errs ))

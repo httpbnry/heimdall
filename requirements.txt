@@ -1,2 +1,6 @@
 requests>=2.28.0
 python-dotenv>=1.0.0
+
+# Opcionales - necesarios según el backend:
+#   mysql-connector-python>=8.0.0   # Para --method sql o decrypt
+#   pycryptodome>=3.0.0             # Para --method decrypt (AES-256-CBC)

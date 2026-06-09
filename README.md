@@ -15,29 +15,61 @@
 
 ## 🔍 ¿Qué hace?
 
-Heimdall extrae todas las cuentas de correo de un servidor **Plesk** mediante `mail_auth_view`, calcula el hash **SHA-1** de cada contraseña y las coteja contra la API de **HaveIBeenPwned** usando el protocolo **k-Anonymity** (nunca envías el hash completo, solo los primeros 5 caracteres).
+Heimdall extrae las contraseñas de correo de un servidor **Plesk** usando **4 métodos en cascada**, calcula el hash **SHA-1** de cada una y las coteja contra **HaveIBeenPwned** mediante **k-Anonymity** (solo envías 5 caracteres del hash, nunca la contraseña completa).
 
-> ✅ Sin enviar contraseñas en claro · sin almacenamiento intermedio · sin depender de BD MySQL
+> ✅ Sin enviar contraseñas en claro · sin almacenamiento intermedio · optimizado por prefijo SHA-1
 
 ## ✨ Características
 
 | Característica | Descripción |
 |---|---|
-| ⚡ **Sin dependencias externas** (Shell) | Usa `curl` + `openssl`/`sha1sum` — 0 librerías |
-| 🐍 **Versión Python** | Para entornos con gestor de paquetes |
+| ⚡ **4 backends de extracción** | Binario → SQL → Desencriptación AES-256 → Archivo manual |
+| ♻️ **Cascada automática** | Prueba todos los métodos hasta que uno funciona |
 | 🔐 **k-Anonymity** | Nunca revelas el hash completo a HIBP |
+| 📦 **Agrupación por prefijo** | 1 llamada API por prefijo SHA-1, no por contraseña |
 | ⏱ **Rate limiting** | 1.5s entre peticiones — respeta los TOS de HIBP |
-| 📄 **Reporte .txt** | Resumen legible con cuentas comprometidas y hashes |
+| 📄 **Reporte .txt** | Resumen legible con cuentas comprometidas |
 | 🧵 **Cron-ready** | Diseñado para ejecución mensual desatendida |
 | 🎨 **Colores en consola** | Salida formateada con semáforo visual |
-| 🛡 **Graceful shutdown** | Responde a SIGINT/SIGTERM sin corromper datos |
 
-## 📋 Requisitos
+## 📋 Extracción de datos
 
-- **Servidor Plesk** (cualquier versión moderna con `mail_auth_view`)
-- **Python 3.8+** (para `heimdall.py`) o **Bash 5.0+** (para `heimdall.sh`)
-- **curl** y **openssl** o **sha1sum** (para la versión Shell)
-- Conexión a Internet (puerto 443) para consultar la API de HIBP
+Heimdall intenta los siguientes métodos en orden. El primero que funciona se usa:
+
+| # | Método | Requiere | Flag |
+|---|---|---|---|
+| 1 | `mail_auth_view` (binario) | Servidor Plesk con acceso al ejecutable | automático |
+| 2 | SQL directo a `mail_auth_view` | Acceso MySQL + `.psa.shadow` | `--method sql` |
+| 3 | Desencriptación AES-256-CBC | MySQL + `/etc/psa/private/secret` | `--method decrypt` |
+| 4 | Archivo plano | Un `.txt` con `email:password` por línea | `--from-file cuentas.txt` |
+
+### Backend 3 — Desencriptación manual
+
+Para servidores donde `mail_auth_view` no existe pero tienes acceso a la BD y al archivo `secret` de Plesk:
+
+```bash
+heimdall.py --method decrypt
+```
+
+El algoritmo:
+- Lee `/etc/psa/private/secret`
+- Deriva clave AES-256: `SHA-256(secret)`
+- Descifra cada password: `IV(16 bytes) + ciphertext` en hex desde tabla `mail`
+- Requiere `pycryptodome` (`pip install pycryptodome`)
+
+### Backend 4 — Archivo manual
+
+Si no puedes ejecutar el script en el servidor Plesk, exporta las cuentas a un archivo:
+
+```bash
+# Formato: email:password (una por línea)
+admin@dominio.com:MiPassword123
+user@dominio.com:OtraPass456
+
+# Ejecutar con:
+heimdall.py --from-file cuentas.txt
+heimdall.sh --from-file cuentas.txt
+```
 
 ## 🚀 Instalación
 
@@ -52,43 +84,50 @@ cd /opt/heimdall
 pip install -r requirements.txt
 ```
 
+Dependencias adicionales para backends específicos:
+```bash
+# Para --method sql o decrypt
+pip install mysql-connector-python
+
+# Solo para --method decrypt (AES-256-CBC)
+pip install pycryptodome
+```
+
 ### Opción B — Shell (sin dependencias)
 
 ```bash
 chmod +x heimdall.sh
-# ¡Ya está! Solo necesita curl y openssl
+# Solo necesita curl, openssl o sha1sum
 ```
 
 ## 🎯 Uso
 
-### Auditoría en vivo
-
+### Automático (cascada)
 ```bash
-# Python
-python3 heimdall.py
+python3 heimdall.py        # Prueba binary → sql → decrypt
+./heimdall.sh              # Solo binary (o --from-file)
+```
 
-# Shell
-./heimdall.sh
+### Desde archivo plano
+```bash
+python3 heimdall.py --from-file cuentas.txt
+./heimdall.sh --from-file cuentas.txt
+```
+
+### Forzar método específico
+```bash
+python3 heimdall.py --method sql
+python3 heimdall.py --method decrypt
 ```
 
 ### Guardar reporte
-
 ```bash
 python3 heimdall.py --txt /var/log/heimdall/reporte.txt
-./heimdall.sh --txt /var/log/heimdall/reporte.txt
 ```
 
-### Solo consola (dry-run)
-
+### Solo consola
 ```bash
 python3 heimdall.py --dry-run
-./heimdall.sh --dry-run
-```
-
-### Modo verbose (debug)
-
-```bash
-python3 heimdall.py -v
 ```
 
 ## 📅 Automatización (cron mensual)
@@ -97,36 +136,22 @@ python3 heimdall.py -v
 sudo crontab -e
 ```
 
-Añade:
-
 ```cron
 0 2 1 * * /opt/heimdall/heimdall.py --txt /var/log/heimdall/$(date +\%Y-\%m).txt
 ```
-
-O con la versión Shell:
-
-```cron
-0 2 1 * * /opt/heimdall/heimdall.sh --txt /var/log/heimdall/$(date +\%Y-\%m).txt
-```
-
-> ℹ️ El primer día de cada mes a las 02:00 se ejecutará la auditoría y guardará un reporte con formato `YYYY-MM.txt`.
 
 ## 📄 Formato del reporte
 
 ```
 ============================================================
-Heimdall - Reporte de auditoría (2026-06-09 02:00:00)
+Heimdall - Reporte (2026-06-09 02:00:00)
 ============================================================
 
 [!] 3 cuenta(s) COMPROMETIDA(S):
 
   - admin@example.com
-    Hash SHA-1: A94A8FE5CCB19BA61C4C0873D391E987982FBBD3
-    Filtrada 1589 vez/veces
-
-  - contacto@example.com
-    Hash SHA-1: C8F3A2F0A94A8FE5CCB19BA61C4C0873D391E987
-    Filtrada 247 vez/veces
+    SHA-1: A94A8FE5CCB19BA61C4C0873D391E987982FBBD3
+    Filtrada 1589x
 
 Resumen: 47 auditadas | 3 comprometidas | 0 errores
 ```
@@ -135,81 +160,61 @@ Resumen: 47 auditadas | 3 comprometidas | 0 errores
 
 ```mermaid
 flowchart LR
-    A[Plesk Server] --> B[mail_auth_view]
-    B --> C{Heimdall}
-    C --> D[SHA-1 hash]
-    D --> E[Primeros 5 chars]
-    E --> F[HIBP API k-Anonymity]
-    F --> G[Comparación local]
-    G --> H[✅ Safe]
-    G --> I[❌ Compromised]
-    C --> J[📄 Reporte .txt]
-    C --> K[🖥️ Consola]
+    A[Servidor Plesk] --> B{Extracción}
+    B --> C[1. mail_auth_view]
+    B --> D[2. SQL mail_auth_view]
+    B --> E[3. AES-256 decrypt]
+    B --> F[4. --from-file]
+    C --> G[Agrupar por prefijo SHA-1]
+    D --> G
+    E --> G
+    F --> G
+    G --> H[HIBP API k-Anonymity]
+    H --> I[Comparación local]
+    I --> J[✅ Safe]
+    I --> K[❌ Compromised]
+    K --> L[📄 Reporte .txt]
+    K --> M[🖥️ Consola]
 ```
 
-## ⚙️ Configuración
-
-La versión Python admite un archivo `.env` en el mismo directorio:
-
-```env
-# Tiempo entre peticiones a la API de HIBP (segundos)
-HIBP_RATE_LIMIT=1.5
-```
-
-La versión Shell se configura editando las variables al inicio del script:
-
-```bash
-readonly RATE_LIMIT=1.5
-readonly HIBP_TIMEOUT=10
-```
-
-## 🧪 Exit codes
+## ⚙️ Exit codes
 
 | Código | Significado |
 |---|---|
-| `0` | Auditoría completada — 0 cuentas comprometidas |
-| `1` | Error crítico (no se encuentra `mail_auth_view`, fallo de red, etc.) |
-| `2` | Auditoría completada — **se encontraron cuentas comprometidas** |
-| `130` | Interrumpido por el usuario (Ctrl+C) |
-
-## 🔒 Seguridad
-
-- **k-Anonymity**: solo se envían 5/40 caracteres del hash SHA-1 — HIBP no puede reconstruir la contraseña original ni saber qué hash completo consultaste.
-- **Zero storage**: las contraseñas solo viven en memoria durante el cálculo del hash.
-- **Sin logs sensibles**: nunca se escriben contraseñas en claro en logs ni reportes.
-- **Ejecución local**: el binario `mail_auth_view` corre exclusivamente en el servidor Plesk.
+| `0` | Sin cuentas comprometidas |
+| `1` | Error crítico |
+| `2` | **Hay cuentas comprometidas** |
+| `130` | Interrumpido (Ctrl+C) |
 
 ## 📦 Dependencias
 
 ### Python (`requirements.txt`)
 
 ```
-requests>=2.28.0
-python-dotenv>=1.0.0
+requests>=2.28.0           # Consultas a HIBP
+python-dotenv>=1.0.0       # Config opcional
 ```
+
+Opcionales:
+- `mysql-connector-python` — para backends SQL y decrypt
+- `pycryptodome` — para backend decrypt (AES-256-CBC)
 
 ### Shell
 
 | Comando | Propósito |
 |---|---|
 | `curl` | Peticiones HTTP a HIBP |
-| `openssl` o `sha1sum` | Cálculo de hash SHA-1 |
-| `bash` (5.0+) | Ejecución del script |
+| `openssl` o `sha1sum` | Cálculo SHA-1 |
 
-## 🤝 Contribuir
+## 🔒 Seguridad
 
-1. Fork del repositorio
-2. Crea una rama (`git checkout -b feature/mejora`)
-3. Commit (`git commit -m 'feat: añadir X'`)
-4. Push (`git push origin feature/mejora`)
-5. Abre un Pull Request
-
-## 📝 Licencia
-
-MIT License — haz lo que quieras, pero si te sirve, una estrella ⭐ siempre se agradece.
+- **k-Anonymity**: solo 5/40 caracteres del hash viajan a HIBP
+- **Zero storage**: contraseñas solo en memoria durante el hash
+- **Sin logs sensibles**: nunca se escriben contraseñas en claro en logs ni reportes
+- **Cascada segura**: si un método falla, pasa al siguiente sin dejar datos intermedios
 
 ---
 
 <div align="center">
-  <sub>Hecho con ❤️ para administradores Plesk que duermen tranquilos.</sub>
+  <sub>Hecho con ❤️ para administradores Plesk que quieren dormir tranquilos.</sub>
 </div>

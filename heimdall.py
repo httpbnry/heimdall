@@ -2,7 +2,7 @@
 """
 Heimdall - Plesk Email Password Auditor
 Audita contraseñas de correo Plesk vs HaveIBeenPwned (k-Anonymity).
-Optimizado: agrupa por prefijo SHA-1 para minimizar llamadas API.
+Extracción en cascada: binario → SQL → desencriptación AES-256 → archivo manual.
 """
 
 import os, sys, re, time, hashlib, logging, argparse, subprocess
@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 
 HIBP_API_URL = "https://api.pwnedpasswords.com/range/"
 MAIL_AUTH_VIEW = "/usr/psa/admin/sbin/mail_auth_view"
+PSA_SHADOW = "/etc/psa/.psa.shadow"
+PSA_SECRET = "/etc/psa/private/secret"
 DEFAULT_RATE_LIMIT = 1.5
 HIBP_TIMEOUT = 10
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -43,22 +45,38 @@ def load_config() -> dict:
     load_dotenv(dotenv_path=ENV_PATH if ENV_PATH.exists() else None)
     return {
         "hibp_rate_limit": float(os.environ.get("HIBP_RATE_LIMIT", str(DEFAULT_RATE_LIMIT))),
+        "db_host": os.environ.get("DB_HOST", "localhost"),
+        "db_port": int(os.environ.get("DB_PORT", "3306")),
+        "db_user": os.environ.get("DB_USER", "admin"),
+        "db_password": os.environ.get("DB_PASSWORD", ""),
     }
 
 
-def extract_mail_accounts() -> list[dict]:
-    if not Path(MAIL_AUTH_VIEW).exists():
-        raise RuntimeError(f"No se encuentra {MAIL_AUTH_VIEW}. ¿Esto es Plesk?")
+def _db_password() -> str:
+    pwd = os.environ.get("DB_PASSWORD", "")
+    if not pwd and Path(PSA_SHADOW).exists():
+        pwd = Path(PSA_SHADOW).read_text().strip()
+    return pwd
 
+
+# ── Backend A: mail_auth_view binario ─────────────────────────────
+
+def _extract_via_binary() -> list[dict] | None:
+    path = Path(MAIL_AUTH_VIEW)
+    if not path.exists():
+        logging.warning("Backend binary: %s no existe", MAIL_AUTH_VIEW)
+        return None
     try:
-        result = subprocess.run([MAIL_AUTH_VIEW], capture_output=True, text=True, timeout=30)
-    except FileNotFoundError as e:
-        raise RuntimeError(f"No se pudo ejecutar {MAIL_AUTH_VIEW}: {e}") from e
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"{MAIL_AUTH_VIEW} no respondió en 30s")
-
+        result = subprocess.run(
+            [str(path)], capture_output=True, text=True, timeout=30
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logging.warning("Backend binary: error ejecutando %s: %s", path, e)
+        return None
     if result.returncode != 0:
-        raise RuntimeError(f"{MAIL_AUTH_VIEW} exit {result.returncode}: {result.stderr.strip()}")
+        logging.warning("Backend binary: exit code %d: %s",
+                        result.returncode, result.stderr.strip())
+        return None
 
     accounts = []
     for line in result.stdout.splitlines():
@@ -72,16 +90,208 @@ def extract_mail_accounts() -> list[dict]:
                 accounts.append({"email": email, "password": password})
         else:
             logging.warning("Línea no parseable: %s", line[:80])
-
+    logging.info("Backend binary: %d cuentas extraídas", len(accounts))
     return accounts
 
+
+# ── Backend B: SQL directo a mail_auth_view ───────────────────────
+
+def _extract_via_sql(cfg: dict) -> list[dict] | None:
+    password = _db_password()
+    if not password:
+        logging.warning("Backend SQL: no hay password DB")
+        return None
+    try:
+        import mysql.connector
+    except ImportError:
+        logging.warning("Backend SQL: mysql-connector-python no instalado")
+        return None
+
+    try:
+        conn = mysql.connector.connect(
+            host=cfg["db_host"], port=cfg["db_port"],
+            database="psa", user=cfg["db_user"],
+            password=password, connection_timeout=5,
+        )
+    except Exception as e:
+        logging.warning("Backend SQL: conexión falló: %s", e)
+        return None
+
+    try:
+        with conn.cursor(dictionary=True) as cur:
+            cur.execute(
+                "SELECT CONCAT(mail_name, '@', domain_id) AS email, password "
+                "FROM mail_auth_view "
+                "WHERE password IS NOT NULL AND password != ''"
+            )
+            rows = cur.fetchall()
+        accounts = [{"email": r["email"], "password": r["password"]} for r in rows]
+        logging.info("Backend SQL: %d cuentas extraídas", len(accounts))
+        return accounts
+    except Exception as e:
+        logging.warning("Backend SQL: query falló: %s", e)
+        return None
+    finally:
+        conn.close()
+
+
+# ── Backend C: desencriptación AES-256-CBC ────────────────────────
+
+def _plesk_decrypt(encrypted_hex: str, secret: bytes) -> str | None:
+    """Descifra password Plesk (AES-256-CBC, key=SHA-256(secret), IV+ct en hex)."""
+    try:
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import unpad
+    except ImportError:
+        logging.error("Backend decrypt: pycryptodome no instalado")
+        return None
+
+    try:
+        raw = bytes.fromhex(encrypted_hex)
+    except (ValueError, TypeError):
+        return None
+
+    if len(raw) < 17:  # IV(16) + al menos 1 byte de ciphertext
+        return None
+
+    key = hashlib.sha256(secret).digest()
+    iv, ct = raw[:16], raw[16:]
+
+    try:
+        cipher = AES.new(key, AES.MODE_CBC, iv=iv)
+        return unpad(cipher.decrypt(ct), AES.block_size).decode("utf-8", errors="replace")
+    except Exception as e:
+        logging.debug("Fallo decrypt (puede ser padding/encoding): %s", e)
+        return None
+
+
+def _extract_via_decrypt(cfg: dict) -> list[dict] | None:
+    secret_path = Path(PSA_SECRET)
+    if not secret_path.exists():
+        logging.warning("Backend decrypt: %s no existe", PSA_SECRET)
+        return None
+
+    password = _db_password()
+    if not password:
+        logging.warning("Backend decrypt: no hay password DB")
+        return None
+
+    try:
+        import mysql.connector
+    except ImportError:
+        logging.warning("Backend decrypt: mysql-connector-python no instalado")
+        return None
+
+    try:
+        conn = mysql.connector.connect(
+            host=cfg["db_host"], port=cfg["db_port"],
+            database="psa", user=cfg["db_user"],
+            password=password, connection_timeout=5,
+        )
+    except Exception as e:
+        logging.warning("Backend decrypt: conexión falló: %s", e)
+        return None
+
+    try:
+        secret = secret_path.read_bytes()
+        with conn.cursor(dictionary=True) as cur:
+            cur.execute(
+                "SELECT m.id, m.mail_name, d.name AS domain, m.password "
+                "FROM mail m JOIN domains d ON m.domain_id = d.id "
+                "WHERE m.password IS NOT NULL AND m.password != ''"
+            )
+            rows = cur.fetchall()
+
+        accounts = []
+        for r in rows:
+            plain = _plesk_decrypt(r["password"], secret)
+            if plain:
+                email = f"{r['mail_name']}@{r['domain']}"
+                accounts.append({"email": email, "password": plain})
+
+        logging.info("Backend decrypt: %d cuentas descifradas de %d intentos",
+                     len(accounts), len(rows))
+        return accounts
+    except Exception as e:
+        logging.warning("Backend decrypt: error: %s", e)
+        return None
+    finally:
+        conn.close()
+
+
+# ── Backend D: archivo manual ────────────────────────────────────
+
+def _extract_from_file(ruta: str) -> list[dict]:
+    path = Path(ruta)
+    if not path.exists():
+        raise RuntimeError(f"Archivo no encontrado: {ruta}")
+    accounts = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = LINE_RE.match(line)
+        if m:
+            email, password = m.group(1), m.group(2)
+            if password:
+                accounts.append({"email": email, "password": password})
+        else:
+            logging.warning("Línea ignorada: %s", line[:80])
+    logging.info("Backend file: %d cuentas desde %s", len(accounts), ruta)
+    return accounts
+
+
+# ── Extract maestro (cascada) ─────────────────────────────────────
+
+BACKENDS = {
+    "binary": _extract_via_binary,
+    "sql": _extract_via_sql,
+    "decrypt": _extract_via_decrypt,
+}
+
+
+def extract_mail_accounts(cfg: dict, method: str = "", from_file: str = "") -> list[dict]:
+    if from_file:
+        return _extract_from_file(from_file)
+
+    if method:
+        if method not in BACKENDS:
+            raise RuntimeError(f"Método inválido: {method}. Opciones: {', '.join(BACKENDS)}")
+        fn = BACKENDS[method]
+        result = fn(cfg) if method in ("sql", "decrypt") else fn()
+        if result is None:
+            raise RuntimeError(f"Método '{method}' no disponible")
+        return result
+
+    # Cascada automática
+    orden = [
+        ("binary", lambda: _extract_via_binary()),
+        ("sql", lambda: _extract_via_sql(cfg)),
+        ("decrypt", lambda: _extract_via_decrypt(cfg)),
+    ]
+    for nombre, fn in orden:
+        result = fn()
+        if result is not None and len(result) > 0:
+            logging.info("Método usado: %s (%d cuentas)", nombre, len(result))
+            return result
+
+    raise RuntimeError(
+        "Ningún método de extracción funcionó.\n"
+        "  Opciones:\n"
+        "    - Ejecutar en un servidor Plesk (usa mail_auth_view automáticamente)\n"
+        "    - Especificar --from-file cuentas.txt (formato email:pass por línea)\n"
+        "    - Especificar --method sql (requiere acceso MySQL + .psa.shadow)\n"
+        "    - Especificar --method decrypt (requiere MySQL + /etc/psa/private/secret)"
+    )
+
+
+# ── SHA-1 + HIBP ─────────────────────────────────────────────────
 
 def sha1_hex(password: str) -> str:
     return hashlib.sha1(password.encode()).hexdigest().upper()
 
 
 def build_prefix_index(accounts: list[dict]) -> tuple[dict, dict]:
-    """Agrupa por hash exacto (dedup) y por prefijo SHA-1 (ahorro API)."""
     hash_to_accounts: dict[str, list[dict]] = defaultdict(list)
     for acct in accounts:
         h = sha1_hex(acct["password"])
@@ -96,7 +306,6 @@ def build_prefix_index(accounts: list[dict]) -> tuple[dict, dict]:
 
 
 def fetch_hibp_suffixes(prefix: str) -> dict[str, int]:
-    """Retorna {suffix: count} para un prefijo dado."""
     try:
         resp = requests.get(
             HIBP_API_URL + prefix,
@@ -105,7 +314,7 @@ def fetch_hibp_suffixes(prefix: str) -> dict[str, int]:
         )
         resp.raise_for_status()
     except requests.RequestException as e:
-        raise RuntimeError(f"Error HIBP ({prefix}): {e}") from e
+        raise RuntimeError(f"HIBP ({prefix}): {e}") from e
 
     result = {}
     for line in resp.text.splitlines():
@@ -115,13 +324,16 @@ def fetch_hibp_suffixes(prefix: str) -> dict[str, int]:
     return result
 
 
-def run_audit(cfg: dict, txt_output: str = "") -> int:
+# ── Auditoría ─────────────────────────────────────────────────────
+
+def run_audit(cfg: dict, txt_output: str = "",
+              method: str = "", from_file: str = "") -> int:
     print(f"\n{COLOR_CYAN}╔════════════════════════════════════╗{COLOR_RESET}")
     print(f"{COLOR_CYAN}║      Heimdall - Plesk Auditor      ║{COLOR_RESET}")
     print(f"{COLOR_CYAN}╚════════════════════════════════════╝{COLOR_RESET}\n")
 
     try:
-        accounts = extract_mail_accounts()
+        accounts = extract_mail_accounts(cfg, method=method, from_file=from_file)
     except RuntimeError as e:
         logging.critical("%s", e)
         return 1
@@ -143,43 +355,34 @@ def run_audit(cfg: dict, txt_output: str = "") -> int:
 
     stats = {"comprometidas": 0, "errores": 0}
     reporte = []
-    hibp_cache: dict[str, dict[str, int]] = {}
-    result_cache: dict[str, dict] = {}
 
     for idx, (prefix, suffix_list) in enumerate(prefix_to_hashes.items(), 1):
-        bar = f"[{idx}/{total_prefijos}]"
-        print(f"  {bar} Prefijo {prefix} ({len(suffix_list)} pwd) ... ", end="", flush=True)
+        print(f"  [{idx}/{total_prefijos}] Prefijo {prefix} "
+              f"({len(suffix_list)} pwd) ... ", end="", flush=True)
 
         time.sleep(cfg["hibp_rate_limit"])
 
         try:
             suffixes = fetch_hibp_suffixes(prefix)
-            hibp_cache[prefix] = suffixes
-            print(f"{COLOR_GREEN}OK{COLOR_RESET} ({len(suffixes)} hashes en respuesta)")
+            print(f"{COLOR_GREEN}OK{COLOR_RESET} ({len(suffixes)} hashes)")
         except RuntimeError as e:
             print(f"{COLOR_RED}ERROR{COLOR_RESET}")
             logging.error("Fallo prefijo %s: %s", prefix, e)
-            for suffix, full_hash in suffix_list:
-                result_cache[full_hash] = {"comprometida": False, "ocurrencias": 0, "error": str(e)}
+            for _, full_hash in suffix_list:
                 for acct in hash_to_accounts[full_hash]:
-                    stats["errores"] += len(hash_to_accounts[full_hash])
+                    stats["errores"] += 1
                     reporte.append({"email": acct["email"], "hash": full_hash,
                                     "comprometida": False, "ocurrencias": 0, "error": str(e)})
             continue
 
         for suffix, full_hash in suffix_list:
             if suffix in suffixes:
-                result_cache[full_hash] = {
-                    "comprometida": True,
-                    "ocurrencias": suffixes[suffix],
-                    "error": None,
-                }
                 for acct in hash_to_accounts[full_hash]:
                     stats["comprometidas"] += 1
                     reporte.append({"email": acct["email"], "hash": full_hash,
-                                    "comprometida": True, "ocurrencias": suffixes[suffix], "error": None})
+                                    "comprometida": True,
+                                    "ocurrencias": suffixes[suffix], "error": None})
             else:
-                result_cache[full_hash] = {"comprometida": False, "ocurrencias": 0, "error": None}
                 for acct in hash_to_accounts[full_hash]:
                     reporte.append({"email": acct["email"], "hash": full_hash,
                                     "comprometida": False, "ocurrencias": 0, "error": None})
@@ -207,11 +410,7 @@ def _guardar_reporte(reporte: list[dict], ruta: str):
     comp = [r for r in reporte if r["comprometida"]]
     errs = [r for r in reporte if r["error"]]
 
-    lines = []
-    lines.append("=" * 60)
-    lines.append(f"Heimdall - Reporte ({fecha})")
-    lines.append("=" * 60)
-    lines.append("")
+    lines = ["=" * 60, f"Heimdall - Reporte ({fecha})", "=" * 60, ""]
     if not comp:
         lines.append("[OK] 0 comprometidas.")
     else:
@@ -229,20 +428,39 @@ def _guardar_reporte(reporte: list[dict], ruta: str):
     lines.append(f"Total: {len(reporte)} | Comp: {len(comp)} | Err: {len(errs)}")
 
     Path(ruta).parent.mkdir(parents=True, exist_ok=True)
-    with open(ruta, "w") as f:
-        f.write("\n".join(lines) + "\n")
+    Path(ruta).write_text("\n".join(lines) + "\n")
     print(f"{COLOR_CYAN}Reporte: {ruta}{COLOR_RESET}")
 
 
+# ── CLI ───────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(description="Heimdall — Plesk Password Auditor")
+    parser = argparse.ArgumentParser(
+        description="Heimdall — Plesk Email Password Auditor",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Ejemplos:\n"
+            "  heimdall.py                                              # cascada auto\n"
+            "  heimdall.py --from-file cuentas.txt                      # archivo plano\n"
+            "  heimdall.py --method sql                                 # forzar SQL\n"
+            "  heimdall.py --method decrypt                             # forzar decrypt\n"
+            "  heimdall.py --txt /var/log/heimdall/mensual.txt          # guardar reporte\n"
+        ),
+    )
     parser.add_argument("--txt", type=str, default="", metavar="FILE",
                         help="Guardar reporte en .txt")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Solo consola, sin guardar")
-    parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args()
+                        help="Solo consola, no guardar")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
 
+    g = parser.add_argument_group("Extracción (por defecto: cascada automática)")
+    g.add_argument("--method", type=str, default="",
+                   choices=["binary", "sql", "decrypt"],
+                   help="Forzar método de extracción")
+    g.add_argument("--from-file", type=str, default="", metavar="FILE",
+                   help="Leer cuentas desde archivo (formato email:pass)")
+
+    args = parser.parse_args()
     setup_logging(args.verbose)
 
     if args.dry_run:
@@ -255,7 +473,8 @@ def main():
         return 1
 
     try:
-        return run_audit(cfg, txt_output=args.txt)
+        return run_audit(cfg, txt_output=args.txt,
+                         method=args.method, from_file=args.from_file)
     except KeyboardInterrupt:
         print("\nInterrumpido.")
         return 130
