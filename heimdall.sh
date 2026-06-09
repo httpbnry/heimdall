@@ -8,7 +8,10 @@
 set -euo pipefail
 
 readonly HIBP_API_URL="https://api.pwnedpasswords.com/range/"
-readonly MAIL_AUTH_VIEW="/usr/psa/admin/sbin/mail_auth_view"
+readonly MAIL_AUTH_VIEW_PATHS=(
+    /usr/local/psa/admin/sbin/mail_auth_view
+    /usr/psa/admin/sbin/mail_auth_view
+)
 readonly RATE_LIMIT=1.5
 readonly HIBP_TIMEOUT=10
 readonly VERSION="2.0"
@@ -95,12 +98,16 @@ main() {
             echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
         done < "$from_file"
     else
-        if ! [[ -f "$MAIL_AUTH_VIEW" ]]; then
-            die "No encontrado: $MAIL_AUTH_VIEW. Usa --from-file como alternativa."
+        local mail_bin=""
+        for p in "${MAIL_AUTH_VIEW_PATHS[@]}"; do
+            [[ -f "$p" ]] && { mail_bin="$p"; break; }
+        done
+        if [[ -z "$mail_bin" ]]; then
+            die "No encontrado: ningún ${MAIL_AUTH_VIEW_PATHS[*]}. Usa --from-file."
         fi
-        if ! [[ -x "$MAIL_AUTH_VIEW" ]]; then
-            echo -e "  ${YELLOW}[!] $MAIL_AUTH_VIEW existe pero no es ejecutable${NC}"
-            echo -e "  Ejecuta: sudo chmod +x $MAIL_AUTH_VIEW"
+        if ! [[ -x "$mail_bin" ]]; then
+            echo -e "  ${YELLOW}[!] $mail_bin existe pero no es ejecutable${NC}"
+            echo -e "  Ejecuta: sudo chmod +x $mail_bin"
             echo -e "  O usa:  heimdall.sh --from-file cuentas.txt\n"
             die "Permiso denegado"
         fi
@@ -113,7 +120,7 @@ main() {
             [[ -z "$password" ]] && continue
             hash=$(sha1_hex "$password")
             echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
-        done < <("$MAIL_AUTH_VIEW" 2>&1 || die "$MAIL_AUTH_VIEW falló (exit code $?)")
+        done < <("$mail_bin" 2>&1 || die "$mail_bin falló (exit code $?)")
     fi
 
     total=$(wc -l < "$hash_file")

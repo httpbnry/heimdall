@@ -15,7 +15,10 @@ from dotenv import load_dotenv
 
 
 HIBP_API_URL = "https://api.pwnedpasswords.com/range/"
-MAIL_AUTH_VIEW = "/usr/psa/admin/sbin/mail_auth_view"
+MAIL_AUTH_VIEW_PATHS = [
+    "/usr/local/psa/admin/sbin/mail_auth_view",
+    "/usr/psa/admin/sbin/mail_auth_view",
+]
 PSA_SHADOW = "/etc/psa/.psa.shadow"
 PSA_SECRET = "/etc/psa/private/secret"
 DEFAULT_RATE_LIMIT = 1.5
@@ -62,9 +65,13 @@ def _db_password() -> str:
 # ── Backend A: mail_auth_view binario ─────────────────────────────
 
 def _extract_via_binary() -> list[dict] | None:
-    path = Path(MAIL_AUTH_VIEW)
-    if not path.exists():
-        logging.warning("Backend binary: %s no existe", MAIL_AUTH_VIEW)
+    path = None
+    for p in MAIL_AUTH_VIEW_PATHS:
+        if Path(p).exists():
+            path = Path(p)
+            break
+    if not path:
+        logging.warning("Backend binary: ningún %s existe", ", ".join(MAIL_AUTH_VIEW_PATHS))
         return None
     try:
         result = subprocess.run(
@@ -90,7 +97,7 @@ def _extract_via_binary() -> list[dict] | None:
                 accounts.append({"email": email, "password": password})
         else:
             logging.warning("Línea no parseable: %s", line[:80])
-    logging.info("Backend binary: %d cuentas extraídas", len(accounts))
+    logging.info("Backend binary: %d cuentas extraídas desde %s", len(accounts), path)
     return accounts
 
 
