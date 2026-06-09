@@ -26,7 +26,9 @@ HIBP_TIMEOUT = 10
 SCRIPT_DIR = Path(__file__).parent.resolve()
 ENV_PATH = SCRIPT_DIR / ".env"
 
-LINE_RE = re.compile(r"^([^@]+@[^:]+):(.+)$")
+# Múltiples formatos de mail_auth_view según versión de Plesk
+LINE_RE_COLON = re.compile(r"^([^@]+@[^:]+):(.+)$")       # email:password
+LINE_RE_WS   = re.compile(r"^(\S+@\S+)\s+(\S+)$")          # email[whitespace]password
 
 COLOR_RED = "\033[91m"
 COLOR_GREEN = "\033[92m"
@@ -62,6 +64,22 @@ def _db_password() -> str:
     return pwd
 
 
+def _parse_mail_line(line: str) -> tuple[str, str] | None:
+    """Intenta extraer email y password de una línea en varios formatos."""
+    m = LINE_RE_COLON.match(line)
+    if m:
+        return m.group(1), m.group(2)
+    m = LINE_RE_WS.match(line)
+    if m:
+        return m.group(1), m.group(2)
+    # Fallback: split por cualquier whitespace, buscar campo con @
+    parts = line.split()
+    for i, p in enumerate(parts):
+        if "@" in p and i + 1 < len(parts):
+            return p, parts[i + 1]
+    return None
+
+
 # ── Backend A: mail_auth_view binario ─────────────────────────────
 
 def _extract_via_binary() -> list[dict] | None:
@@ -90,9 +108,9 @@ def _extract_via_binary() -> list[dict] | None:
         line = line.strip()
         if not line:
             continue
-        m = LINE_RE.match(line)
-        if m:
-            email, password = m.group(1), m.group(2)
+        parsed = _parse_mail_line(line)
+        if parsed:
+            email, password = parsed
             if password:
                 accounts.append({"email": email, "password": password})
         else:
@@ -237,9 +255,9 @@ def _extract_from_file(ruta: str) -> list[dict]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        m = LINE_RE.match(line)
-        if m:
-            email, password = m.group(1), m.group(2)
+        parsed = _parse_mail_line(line)
+        if parsed:
+            email, password = parsed
             if password:
                 accounts.append({"email": email, "password": password})
         else:

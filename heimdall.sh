@@ -33,7 +33,39 @@ usage() {
 }
 
 
-die() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${RED}FATAL${NC} $1" >&2; exit 1; }
+log() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1 $2" >&2; }
+die() { log "${RED}FATAL${NC}" "$1"; exit 1; }
+
+
+# Intenta extraer email y password de una línea (formatos: colon, whitespace, tab)
+parse_mail_line() {
+    local line="$1" email password
+    # Formato email:password
+    if [[ "$line" == *@*:* ]]; then
+        email="${line%%:*}"
+        password="${line#*:}"
+        email=$(echo "$email" | xargs)
+        password=$(echo "$password" | xargs)
+        [[ -n "$password" ]] && { echo "$email|$password"; return 0; }
+    fi
+    # Formato email[whitespace]password
+    if [[ "$line" =~ ^([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+)[[:space:]]+(.+)$ ]]; then
+        email="${BASH_REMATCH[1]}"
+        password="${BASH_REMATCH[2]}"
+        [[ -n "$password" ]] && { echo "$email|$password"; return 0; }
+    fi
+    # Fallback: split por whitespace, buscar campo con @
+    local -a parts
+    read -ra parts <<< "$line"
+    for i in "${!parts[@]}"; do
+        if [[ "${parts[$i]}" == *@* ]] && (( i + 1 < ${#parts[@]} )); then
+            email="${parts[$i]}"
+            password="${parts[$((i+1))]}"
+            [[ -n "$password" ]] && { echo "$email|$password"; return 0; }
+        fi
+    done
+    return 1
+}
 
 
 sha1_hex() {
@@ -88,12 +120,9 @@ main() {
     if [[ -n "$from_file" ]]; then
         [[ -f "$from_file" ]] || die "Archivo no encontrado: $from_file"
         while IFS= read -r line; do
-            [[ -z "$line" || "$line" == "#"* || "$line" != *@*:* ]] && continue
-            email="${line%%:*}"
-            password="${line#*:}"
-            email=$(echo "$email" | xargs)
-            password=$(echo "$password" | xargs)
-            [[ -z "$password" ]] && continue
+            [[ -z "$line" || "$line" == "#"* ]] && continue
+            parsed=$(parse_mail_line "$line") || continue
+            IFS='|' read -r email password <<< "$parsed"
             hash=$(sha1_hex "$password")
             echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
         done < "$from_file"
@@ -112,12 +141,9 @@ main() {
             die "Permiso denegado"
         fi
         while IFS= read -r line; do
-            [[ -z "$line" || "$line" != *@*:* ]] && continue
-            email="${line%%:*}"
-            password="${line#*:}"
-            email=$(echo "$email" | xargs)
-            password=$(echo "$password" | xargs)
-            [[ -z "$password" ]] && continue
+            [[ -z "$line" ]] && continue
+            parsed=$(parse_mail_line "$line") || { log "${YELLOW}WARN${NC}" "Línea no parseable: ${line:0:80}"; continue; }
+            IFS='|' read -r email password <<< "$parsed"
             hash=$(sha1_hex "$password")
             echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
         done < <("$mail_bin" 2>&1 || die "$mail_bin falló (exit code $?)")
