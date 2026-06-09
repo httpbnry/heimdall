@@ -95,7 +95,15 @@ main() {
             echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
         done < "$from_file"
     else
-        [[ -x "$MAIL_AUTH_VIEW" ]] || die "No encontrado: $MAIL_AUTH_VIEW. Usa --from-file como alternativa."
+        if ! [[ -f "$MAIL_AUTH_VIEW" ]]; then
+            die "No encontrado: $MAIL_AUTH_VIEW. Usa --from-file como alternativa."
+        fi
+        if ! [[ -x "$MAIL_AUTH_VIEW" ]]; then
+            echo -e "  ${YELLOW}[!] $MAIL_AUTH_VIEW existe pero no es ejecutable${NC}"
+            echo -e "  Ejecuta: sudo chmod +x $MAIL_AUTH_VIEW"
+            echo -e "  O usa:  heimdall.sh --from-file cuentas.txt\n"
+            die "Permiso denegado"
+        fi
         while IFS= read -r line; do
             [[ -z "$line" || "$line" != *@*:* ]] && continue
             email="${line%%:*}"
@@ -105,7 +113,7 @@ main() {
             [[ -z "$password" ]] && continue
             hash=$(sha1_hex "$password")
             echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
-        done < <("$MAIL_AUTH_VIEW" 2>/dev/null || die "$MAIL_AUTH_VIEW falló")
+        done < <("$MAIL_AUTH_VIEW" 2>&1 || die "$MAIL_AUTH_VIEW falló (exit code $?)")
     fi
 
     total=$(wc -l < "$hash_file")
