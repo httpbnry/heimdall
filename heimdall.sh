@@ -36,6 +36,12 @@ usage() {
 log() { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1 $2" >&2; }
 die() { log "${RED}FATAL${NC}" "$1"; exit 1; }
 
+PSA_SQLITE_PATHS=(
+    /usr/local/psa/admin/conf/psa.db
+    /usr/local/psa/var/psa.db
+    /opt/psa/admin/conf/psa.db
+)
+
 
 # Intenta extraer email y password de una línea (formatos: colon, whitespace, tab)
 parse_mail_line() {
@@ -76,6 +82,29 @@ sha1_hex() {
     else
         die "No hay openssl ni sha1sum"
     fi
+}
+
+
+# Intenta extraer cuentas desde SQLite (Plesk sin MySQL)
+extract_sqlite() {
+    local db=""
+    for p in "${PSA_SQLITE_PATHS[@]}"; do
+        [[ -f "$p" ]] && { db="$p"; break; }
+    done
+    [[ -z "$db" ]] && return 1
+    command -v sqlite3 &>/dev/null || return 1
+
+    # Intentar mail_auth_view primero (devuelve texto plano)
+    local has_view
+    has_view=$(sqlite3 "$db" "SELECT name FROM sqlite_master WHERE type='view' AND name='mail_auth_view';" 2>/dev/null)
+    if [[ -n "$has_view" ]]; then
+        sqlite3 -separator ': ' "$db" "SELECT mail_name || '@' || domain_id, password FROM mail_auth_view WHERE password IS NOT NULL AND password != '';" 2>/dev/null && return 0
+    fi
+
+    # Fallback: tabla mail + domains
+    sqlite3 -separator ': ' "$db" "SELECT m.mail_name || '@' || d.name, m.password FROM mail m JOIN domains d ON m.domain_id = d.id WHERE m.password IS NOT NULL AND m.password != '';" 2>/dev/null && return 0
+
+    return 1
 }
 
 
@@ -127,26 +156,41 @@ main() {
             echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
         done < "$from_file"
     else
-        local mail_bin=""
-        for p in "${MAIL_AUTH_VIEW_PATHS[@]}"; do
-            [[ -f "$p" ]] && { mail_bin="$p"; break; }
-        done
-        if [[ -z "$mail_bin" ]]; then
-            die "No encontrado: ningún ${MAIL_AUTH_VIEW_PATHS[*]}. Usa --from-file."
+        # Intentar SQLite primero
+        local sqlite_out
+        sqlite_out=$(mktemp); trap "rm -f $sqlite_out $hash_file $report_file" EXIT
+        if extract_sqlite > "$sqlite_out" 2>/dev/null && [[ -s "$sqlite_out" ]]; then
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                parsed=$(parse_mail_line "$line") || continue
+                IFS='|' read -r email password <<< "$parsed"
+                hash=$(sha1_hex "$password")
+                echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
+            done < "$sqlite_out"
+            rm -f "$sqlite_out"
+        else
+            rm -f "$sqlite_out"
+            local mail_bin=""
+            for p in "${MAIL_AUTH_VIEW_PATHS[@]}"; do
+                [[ -f "$p" ]] && { mail_bin="$p"; break; }
+            done
+            if [[ -z "$mail_bin" ]]; then
+                die "No encontrado: ningún ${MAIL_AUTH_VIEW_PATHS[*]} ni BD SQLite. Usa --from-file."
+            fi
+            if ! [[ -x "$mail_bin" ]]; then
+                echo -e "  ${YELLOW}[!] $mail_bin existe pero no es ejecutable${NC}"
+                echo -e "  Ejecuta: sudo chmod +x $mail_bin"
+                echo -e "  O usa:  heimdall.sh --from-file cuentas.txt\n"
+                die "Permiso denegado"
+            fi
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                parsed=$(parse_mail_line "$line") || { log "${YELLOW}WARN${NC}" "Línea no parseable: ${line:0:80}"; continue; }
+                IFS='|' read -r email password <<< "$parsed"
+                hash=$(sha1_hex "$password")
+                echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
+            done < <("$mail_bin" 2>&1 || die "$mail_bin falló (exit code $?)")
         fi
-        if ! [[ -x "$mail_bin" ]]; then
-            echo -e "  ${YELLOW}[!] $mail_bin existe pero no es ejecutable${NC}"
-            echo -e "  Ejecuta: sudo chmod +x $mail_bin"
-            echo -e "  O usa:  heimdall.sh --from-file cuentas.txt\n"
-            die "Permiso denegado"
-        fi
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            parsed=$(parse_mail_line "$line") || { log "${YELLOW}WARN${NC}" "Línea no parseable: ${line:0:80}"; continue; }
-            IFS='|' read -r email password <<< "$parsed"
-            hash=$(sha1_hex "$password")
-            echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
-        done < <("$mail_bin" 2>&1 || die "$mail_bin falló (exit code $?)")
     fi
 
     total=$(wc -l < "$hash_file")

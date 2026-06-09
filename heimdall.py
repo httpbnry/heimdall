@@ -21,6 +21,11 @@ MAIL_AUTH_VIEW_PATHS = [
 ]
 PSA_SHADOW = "/etc/psa/.psa.shadow"
 PSA_SECRET = "/etc/psa/private/secret"
+PSA_SQLITE_PATHS = [
+    "/usr/local/psa/admin/conf/psa.db",
+    "/usr/local/psa/var/psa.db",
+    "/opt/psa/admin/conf/psa.db",
+]
 DEFAULT_RATE_LIMIT = 1.5
 HIBP_TIMEOUT = 10
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -244,6 +249,78 @@ def _extract_via_decrypt(cfg: dict) -> list[dict] | None:
         conn.close()
 
 
+# ── Backend E: SQLite directo (Plesk sin MySQL) ─────────────────
+
+
+def _extract_via_sqlite(cfg: dict) -> list[dict] | None:
+    import sqlite3
+
+    db_path = None
+    for p in PSA_SQLITE_PATHS:
+        if Path(p).exists():
+            db_path = p
+            break
+    if not db_path:
+        logging.warning("Backend SQLite: ningún %s existe", ", ".join(PSA_SQLITE_PATHS))
+        return None
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+    except Exception as e:
+        logging.warning("Backend SQLite: conexión falló a %s: %s", db_path, e)
+        return None
+
+    try:
+        cur = conn.cursor()
+        # Intentar vista mail_auth_view (si existe en SQLite)
+        try:
+            cur.execute("SELECT name FROM sqlite_master WHERE type='view' AND name='mail_auth_view'")
+            if cur.fetchone():
+                cur.execute(
+                    "SELECT mail_name || '@' || domain_id AS email, password "
+                    "FROM mail_auth_view WHERE password IS NOT NULL AND password != ''"
+                )
+                rows = cur.fetchall()
+                accounts = [{"email": r["email"], "password": r["password"]} for r in rows]
+                if accounts:
+                    logging.info("Backend SQLite: %d cuentas desde mail_auth_view", len(accounts))
+                    return accounts
+        except Exception:
+            pass
+
+        # Fallback: tabla mail + domains + posiblemente secret
+        secret = None
+        secret_path = Path(PSA_SECRET)
+        if secret_path.exists():
+            secret = secret_path.read_bytes()
+
+        cur.execute(
+            "SELECT m.id, m.mail_name, d.name AS domain, m.password "
+            "FROM mail m JOIN domains d ON m.domain_id = d.id "
+            "WHERE m.password IS NOT NULL AND m.password != ''"
+        )
+        rows = cur.fetchall()
+        accounts = []
+        for r in rows:
+            pwd = r["password"]
+            if secret and pwd and all(c in "0123456789abcdefABCDEF" for c in pwd):
+                plain = _plesk_decrypt(pwd, secret)
+                if plain:
+                    pwd = plain
+            if pwd:
+                email = f"{r['mail_name']}@{r['domain']}"
+                accounts.append({"email": email, "password": pwd})
+
+        logging.info("Backend SQLite: %d cuentas desde %s", len(accounts), db_path)
+        return accounts
+    except Exception as e:
+        logging.warning("Backend SQLite: query falló: %s", e)
+        return None
+    finally:
+        conn.close()
+
+
 # ── Backend D: archivo manual ────────────────────────────────────
 
 def _extract_from_file(ruta: str) -> list[dict]:
@@ -272,6 +349,7 @@ BACKENDS = {
     "binary": _extract_via_binary,
     "sql": _extract_via_sql,
     "decrypt": _extract_via_decrypt,
+    "sqlite": _extract_via_sqlite,
 }
 
 
@@ -292,6 +370,7 @@ def extract_mail_accounts(cfg: dict, method: str = "", from_file: str = "") -> l
     orden = [
         ("binary", lambda: _extract_via_binary()),
         ("sql", lambda: _extract_via_sql(cfg)),
+        ("sqlite", lambda: _extract_via_sqlite(cfg)),
         ("decrypt", lambda: _extract_via_decrypt(cfg)),
     ]
     for nombre, fn in orden:
@@ -304,9 +383,10 @@ def extract_mail_accounts(cfg: dict, method: str = "", from_file: str = "") -> l
         "Ningún método de extracción funcionó.\n"
         "  Opciones:\n"
         "    - Ejecutar en un servidor Plesk (usa mail_auth_view automáticamente)\n"
-        "    - Especificar --from-file cuentas.txt (formato email:pass por línea)\n"
-        "    - Especificar --method sql (requiere acceso MySQL + .psa.shadow)\n"
-        "    - Especificar --method decrypt (requiere MySQL + /etc/psa/private/secret)"
+        "    - Especificar --from-file cuentas.txt\n"
+        "    - Especificar --method sql (MySQL + .psa.shadow)\n"
+        "    - Especificar --method sqlite (SQLite: psa.db)\n"
+        "    - Especificar --method decrypt (MySQL / SQLite + secret)"
     )
 
 
@@ -480,7 +560,7 @@ def main():
 
     g = parser.add_argument_group("Extracción (por defecto: cascada automática)")
     g.add_argument("--method", type=str, default="",
-                   choices=["binary", "sql", "decrypt"],
+                   choices=["binary", "sql", "sqlite", "decrypt"],
                    help="Forzar método de extracción")
     g.add_argument("--from-file", type=str, default="", metavar="FILE",
                    help="Leer cuentas desde archivo (formato email:pass)")
