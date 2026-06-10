@@ -60,6 +60,7 @@ def load_config() -> dict:
         "db_port": int(os.environ.get("DB_PORT", "3306")),
         "db_user": os.environ.get("DB_USER", "admin"),
         "db_password": os.environ.get("DB_PASSWORD", ""),
+        "dump_raw": "",
     }
 
 
@@ -71,40 +72,46 @@ def _db_password() -> str:
 
 
 def _parse_mail_line(line: str) -> tuple[str, str] | None:
-    """Intenta extraer email y password de mail_auth_view (formato pipe table)."""
-    line_stripped = line.strip()
-    # Saltar líneas de cabecera: guiones, "address", "flags", "password"
-    if not line_stripped or line_stripped.startswith("-") or \
-       "address" in line_stripped.lower() or \
-       (line_stripped.count("|") > 0 and "flags" in line_stripped.lower()):
+    """Extrae email y password de mail_auth_view (tabla con pipes, colon, o espacios)."""
+    s = line.strip()
+    if not s or "@" not in s:
         return None
-    # Formato tabla con pipes: | email | flags | password |
-    if "|" in line_stripped:
-        parts = [p.strip() for p in line_stripped.split("|")]
-        parts = [p for p in parts if p]  # quitar vacíos
-        if len(parts) >= 3 and "@" in parts[0]:
-            email, password = parts[0], parts[2]
+
+    # Formato tabla con pipes: ... | email | flags | password | ...
+    if "|" in s:
+        parts = [p.strip() for p in s.split("|")]
+        parts = [p for p in parts if p]
+        email_i = next((i for i, p in enumerate(parts) if "@" in p), -1)
+        if email_i >= 0 and email_i + 2 < len(parts):
+            email, password = parts[email_i], parts[email_i + 2]
             logging.debug("Parsed [pipe] -> email=%s pass=%s", email, password[:20])
             return email, password
-    # Formato email:password
-    m = LINE_RE_COLON.match(line_stripped)
+
+    # Formato email@dominio:password
+    m = LINE_RE_COLON.match(s)
     if m:
-        email, password = m.group(1), m.group(2)
-        logging.debug("Parsed [colon] -> email=%s pass=%s", email, password[:20])
-        return email, password
-    # Formato email[whitespace]password
-    m = LINE_RE_WS.match(line_stripped)
+        logging.debug("Parsed [colon] -> email=%s pass=%s", m.group(1), m.group(2)[:20])
+        return m.group(1), m.group(2)
+
+    # Formato email@dominio password
+    m = LINE_RE_WS.match(s)
     if m:
-        email, password = m.group(1), m.group(2)
-        logging.debug("Parsed [space] -> email=%s pass=%s", email, password[:20])
-        return email, password
-    logging.debug("No parseable: %s", line_stripped[:80])
+        logging.debug("Parsed [space] -> email=%s pass=%s", m.group(1), m.group(2)[:20])
+        return m.group(1), m.group(2)
+
+    # Fallback: split whitespace, buscar campo con @
+    parts = s.split()
+    for i, p in enumerate(parts):
+        if "@" in p and i + 1 < len(parts):
+            logging.debug("Parsed [fallback] -> email=%s pass=%s", p, parts[i+1][:20])
+            return p, parts[i + 1]
+
     return None
 
 
 # ── Backend A: mail_auth_view binario ─────────────────────────────
 
-def _extract_via_binary() -> list[dict] | None:
+def _extract_via_binary(dump_raw: str = "") -> list[dict] | None:
     path = None
     for p in MAIL_AUTH_VIEW_PATHS:
         if Path(p).exists():
@@ -125,6 +132,11 @@ def _extract_via_binary() -> list[dict] | None:
                         result.returncode, result.stderr.strip())
         return None
 
+    if dump_raw:
+        Path(dump_raw).write_text(result.stdout)
+        logging.info("Raw output guardado en %s", dump_raw)
+        print(f"  {COLOR_CYAN}Raw guardado: {dump_raw}{COLOR_RESET}")
+
     accounts = []
     for line in result.stdout.splitlines():
         line = line.strip()
@@ -136,7 +148,7 @@ def _extract_via_binary() -> list[dict] | None:
             if password:
                 accounts.append({"email": email, "password": password})
         else:
-            logging.warning("Línea no parseable: %s", line[:80])
+            logging.debug("Línea no parseable: %s", line[:80])
     logging.info("Backend binary: %d cuentas extraídas desde %s", len(accounts), path)
     return accounts
 
@@ -378,14 +390,17 @@ def extract_mail_accounts(cfg: dict, method: str = "", from_file: str = "") -> l
         if method not in BACKENDS:
             raise RuntimeError(f"Método inválido: {method}. Opciones: {', '.join(BACKENDS)}")
         fn = BACKENDS[method]
-        result = fn(cfg) if method in ("sql", "decrypt") else fn()
+        if method == "binary":
+            result = _extract_via_binary(cfg.get("dump_raw", ""))
+        else:
+            result = fn(cfg) if method in ("sql", "decrypt", "sqlite") else fn()
         if result is None:
             raise RuntimeError(f"Método '{method}' no disponible")
         return result
 
     # Cascada automática
     orden = [
-        ("binary", lambda: _extract_via_binary()),
+        ("binary", lambda: _extract_via_binary(cfg.get("dump_raw", ""))),
         ("sql", lambda: _extract_via_sql(cfg)),
         ("sqlite", lambda: _extract_via_sqlite(cfg)),
         ("decrypt", lambda: _extract_via_decrypt(cfg)),
@@ -449,11 +464,13 @@ def fetch_hibp_suffixes(prefix: str) -> dict[str, int]:
 # ── Auditoría ─────────────────────────────────────────────────────
 
 def run_audit(cfg: dict, txt_output: str = "",
-              method: str = "", from_file: str = "") -> int:
+              method: str = "", from_file: str = "",
+              dump_raw: str = "") -> int:
     print(f"\n{COLOR_CYAN}╔════════════════════════════════════╗{COLOR_RESET}")
     print(f"{COLOR_CYAN}║      Heimdall - Plesk Auditor      ║{COLOR_RESET}")
     print(f"{COLOR_CYAN}╚════════════════════════════════════╝{COLOR_RESET}\n")
 
+    cfg["dump_raw"] = dump_raw
     try:
         accounts = extract_mail_accounts(cfg, method=method, from_file=from_file)
     except RuntimeError as e:
@@ -593,6 +610,8 @@ def main():
                    help="Forzar método de extracción")
     g.add_argument("--from-file", type=str, default="", metavar="FILE",
                    help="Leer cuentas desde archivo (formato email:pass)")
+    g.add_argument("--dump-raw", type=str, default="", metavar="FILE",
+                   help="Guardar raw de mail_auth_view (debug)")
 
     args = parser.parse_args()
     setup_logging(args.verbose)
@@ -608,7 +627,8 @@ def main():
 
     try:
         return run_audit(cfg, txt_output=args.txt,
-                         method=args.method, from_file=args.from_file)
+                         method=args.method, from_file=args.from_file,
+                         dump_raw=args.dump_raw)
     except KeyboardInterrupt:
         print("\nInterrumpido.")
         return 130
