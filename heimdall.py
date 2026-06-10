@@ -31,9 +31,9 @@ HIBP_TIMEOUT = 10
 SCRIPT_DIR = Path(__file__).parent.resolve()
 ENV_PATH = SCRIPT_DIR / ".env"
 
-# Múltiples formatos de mail_auth_view según versión de Plesk
-LINE_RE_COLON = re.compile(r"^([^@]+@[^:]+):(.+)$")       # email:password
-LINE_RE_WS   = re.compile(r"^(\S+@\S+)\s+(\S+)$")          # email[whitespace]password
+# Formatos de mail_auth_view
+LINE_RE_COLON = re.compile(r"^([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}):(.+)$")
+LINE_RE_WS   = re.compile(r"^([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\s+(\S+)$")
 
 COLOR_RED = "\033[91m"
 COLOR_GREEN = "\033[92m"
@@ -73,15 +73,22 @@ def _parse_mail_line(line: str) -> tuple[str, str] | None:
     """Intenta extraer email y password de una línea en varios formatos."""
     m = LINE_RE_COLON.match(line)
     if m:
-        return m.group(1), m.group(2)
+        email, password = m.group(1), m.group(2)
+        logging.debug("Parsed [colon] -> email=%s pass=%s", email, password[:20])
+        return email, password
     m = LINE_RE_WS.match(line)
     if m:
-        return m.group(1), m.group(2)
-    # Fallback: split por cualquier whitespace, buscar campo con @
+        email, password = m.group(1), m.group(2)
+        logging.debug("Parsed [space] -> email=%s pass=%s", email, password[:20])
+        return email, password
+    # Fallback: split por whitespace, buscar campo con @
     parts = line.split()
     for i, p in enumerate(parts):
         if "@" in p and i + 1 < len(parts):
-            return p, parts[i + 1]
+            email, password = p, parts[i + 1]
+            logging.debug("Parsed [fallback] -> email=%s pass=%s", email, password[:20])
+            return email, password
+    logging.debug("No parseable: %s", line[:80])
     return None
 
 
@@ -453,11 +460,9 @@ def run_audit(cfg: dict, txt_output: str = "",
     total_prefijos = len(prefix_to_hashes)
     duplicados = total_cuentas - total_unicas
 
-    ahorro = duplicados + (total_unicas - total_prefijos)
     print(f"  {COLOR_BOLD}{total_cuentas}{COLOR_RESET} cuentas · "
           f"{COLOR_BOLD}{total_unicas}{COLOR_RESET} únicas · "
-          f"{COLOR_BOLD}{total_prefijos}{COLOR_RESET} prefijos · "
-          f"{COLOR_GREEN}{ahorro}{COLOR_RESET} llamadas ahorradas\n")
+          f"{COLOR_BOLD}{total_prefijos}{COLOR_RESET} prefijos\n")
 
     stats = {"comprometidas": 0, "errores": 0}
     reporte = []
@@ -507,7 +512,6 @@ def run_audit(cfg: dict, txt_output: str = "",
     print(f"  Seguras   : {COLOR_GREEN}{seguras}{COLOR_RESET}")
     print(f"  {"Comprometidas"}  : {COLOR_RED}{stats['comprometidas']}{COLOR_RESET}")
     print(f"  Errores   : {COLOR_YELLOW}{stats['errores']}{COLOR_RESET}")
-    print(f"  Ahorro    : {COLOR_GREEN}{ahorro} llamadas API{COLOR_RESET}")
     print(f"  {'=' * 48}\n")
 
     if comprometidas_list:

@@ -43,33 +43,21 @@ PSA_SQLITE_PATHS=(
 )
 
 
-# Intenta extraer email y password de una línea (formatos: colon, whitespace, tab)
+# Intenta extraer email y password de una línea
 parse_mail_line() {
     local line="$1" email password
-    # Formato email:password
-    if [[ "$line" == *@*:* ]]; then
-        email="${line%%:*}"
-        password="${line#*:}"
-        email=$(echo "$email" | xargs)
-        password=$(echo "$password" | xargs)
-        [[ -n "$password" ]] && { echo "$email|$password"; return 0; }
-    fi
-    # Formato email[whitespace]password
-    if [[ "$line" =~ ^([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]+)[[:space:]]+(.+)$ ]]; then
+    # Formato email:password (regex estricto)
+    if [[ "$line" =~ ^([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):(.+)$ ]]; then
         email="${BASH_REMATCH[1]}"
         password="${BASH_REMATCH[2]}"
         [[ -n "$password" ]] && { echo "$email|$password"; return 0; }
     fi
-    # Fallback: split por whitespace, buscar campo con @
-    local -a parts
-    read -ra parts <<< "$line"
-    for i in "${!parts[@]}"; do
-        if [[ "${parts[$i]}" == *@* ]] && (( i + 1 < ${#parts[@]} )); then
-            email="${parts[$i]}"
-            password="${parts[$((i+1))]}"
-            [[ -n "$password" ]] && { echo "$email|$password"; return 0; }
-        fi
-    done
+    # Formato email[whitespace]password
+    if [[ "$line" =~ ^([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})[[:space:]]+([^[:space:]]+)$ ]]; then
+        email="${BASH_REMATCH[1]}"
+        password="${BASH_REMATCH[2]}"
+        [[ -n "$password" ]] && { echo "$email|$password"; return 0; }
+    fi
     return 1
 }
 
@@ -206,8 +194,7 @@ main() {
     # Agrupar por prefijo
     total_prefixes=$(cut -d'|' -f1 "$dedup_file" | sort -u | wc -l)
 
-    local ahorro=$(( duplicados + (unicas - total_prefixes) ))
-    echo -e "  ${BOLD}${total}${NC} cuentas · ${BOLD}${unicas}${NC} únicas · ${BOLD}${total_prefixes}${NC} prefijos · ${GREEN}${ahorro}${NC} llamadas ahorradas"
+    echo -e "  ${BOLD}${total}${NC} cuentas · ${BOLD}${unicas}${NC} únicas · ${BOLD}${total_prefixes}${NC} prefijos"
     echo ""
 
     # Fase 2: agrupar por prefijo y procesar cada grupo
@@ -272,7 +259,6 @@ main() {
     echo -e "  Seguras   : ${GREEN}${safe}${NC}"
     echo -e "  Comprometidas : ${RED}${comp}${NC}"
     echo -e "  Errores   : ${YELLOW}${errs}${NC}"
-    echo -e "  Ahorro    : ${GREEN}${ahorro} llamadas API${NC}"
     echo -e "  ${BOLD}==================================================${NC}"
     echo ""
 
