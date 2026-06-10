@@ -172,7 +172,7 @@ main() {
             parsed=$(parse_mail_line "$line") || continue
             IFS='|' read -r email password <<< "$parsed"
             hash=$(sha1_hex "$password")
-            echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
+            echo "${hash:0:5}|${hash:5}|$email|$password" >> "$hash_file"
         done < "$from_file"
     else
         # Intentar SQLite primero
@@ -184,7 +184,7 @@ main() {
                 parsed=$(parse_mail_line "$line") || continue
                 IFS='|' read -r email password <<< "$parsed"
                 hash=$(sha1_hex "$password")
-                echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
+                echo "${hash:0:5}|${hash:5}|$email|$password" >> "$hash_file"
             done < "$sqlite_out"
             rm -f "$sqlite_out"
         else
@@ -207,7 +207,7 @@ main() {
                 parsed=$(parse_mail_line "$line") || { log "${YELLOW}WARN${NC}" "Línea no parseable: ${line:0:80}"; continue; }
                 IFS='|' read -r email password <<< "$parsed"
                 hash=$(sha1_hex "$password")
-                echo "${hash:0:5}|${hash:5}|$email" >> "$hash_file"
+                echo "${hash:0:5}|${hash:5}|$email|$password" >> "$hash_file"
             done < <("$mail_bin" 2>&1 || die "$mail_bin falló (exit code $?)")
         fi
     fi
@@ -226,7 +226,6 @@ main() {
     total_prefixes=$(cut -d'|' -f1 "$dedup_file" | sort -u | wc -l)
 
     echo -e "  ${BOLD}${total}${NC} cuentas · ${BOLD}${unicas}${NC} únicas · ${BOLD}${total_prefixes}${NC} prefijos"
-    echo ""
 
     # Fase 2: agrupar por prefijo y procesar cada grupo
     prefix_count=0
@@ -238,31 +237,27 @@ main() {
         local entries buf
         entries=$(grep "^${prefix}|" "$dedup_file" || true)
 
-        local -a emails=() suffixes=()
-        while IFS='|' read -r _ s e; do
-            suffixes+=("$s"); emails+=("$e")
+        local -a emails=() suffixes=() passwords=()
+        while IFS='|' read -r _ s e p; do
+            suffixes+=("$s"); emails+=("$e"); passwords+=("$p")
         done <<< "$entries"
         [[ "${#emails[@]}" -eq 0 ]] && continue
 
-        # Mostrar cada cuenta de este prefijo
-        echo ""
-        echo -e "  ${BOLD}-- [${prefix_count}/${total_prefixes}] Prefijo ${prefix} (${#emails[@]} pwd)${NC}"
-        for i in "${!emails[@]}"; do
-            e="${emails[$i]}"
-            echo "    ${e}"
-        done
-        printf "    Consultando HIBP ... "
+        # Mostrar progreso en una sola línea
+        pwd_prev="${passwords[0]}"
+        if [[ -t 1 ]]; then
+            printf "  \r  ${CYAN}[${prefix_count}/${total_prefixes}]${NC} %s:${YELLOW}%-20.20s${NC} comprobando...  " \
+                "${emails[0]}" "$pwd_prev"
+        fi
 
         buf=$(fetch_prefix "$prefix") || true
         if [[ -z "$buf" ]]; then
-            echo -e "${RED}ERROR${NC}"
             for i in "${!emails[@]}"; do
                 echo "ERROR|${emails[$i]}|${prefix}${suffixes[$i]}" >> "$report_file"
                 errs=$(( errs + 1 ))
             done
             continue
         fi
-        echo -e "${GREEN}OK${NC}"
 
         for i in "${!emails[@]}"; do
             s="${suffixes[$i]}"; e="${emails[$i]}"
@@ -272,30 +267,34 @@ main() {
                 count="${count%%[[:space:]]*}"
                 echo "COMPROMISED|${e}|${prefix}${s}|${count}" >> "$report_file"
                 comp=$(( comp + 1 ))
-                comprometidas_emails+=("$e")
-                echo -e "    ${RED}⚠ COMPROMETIDA: ${e} (filtrada ${count}x)${NC}"
+                comprometidas_emails+=("$e:${passwords[$i]}:$count")
             else
                 echo "SAFE|${e}|${prefix}${s}|0" >> "$report_file"
             fi
         done
-        echo ""
     done < <(cut -d'|' -f1 "$dedup_file" | sort -u)
 
-    # Resumen
+    # Borrar línea de progreso
+    if [[ -t 1 ]]; then
+        printf "  %-80s\r" " "
+    fi
     safe=$(( total - comp - errs ))
     echo ""
     echo -e "  ${BOLD}==================================================${NC}"
     echo -e "  Total     : ${total}"
+    if (( errs > 0 )); then
+        echo -e "  Errores   : ${YELLOW}${errs}${NC}"
+    fi
     echo -e "  Seguras   : ${GREEN}${safe}${NC}"
-    echo -e "  Comprometidas : ${RED}${comp}${NC}"
-    echo -e "  Errores   : ${YELLOW}${errs}${NC}"
+    echo -e "  ${RED}Comprometidas : ${comp}${NC}"
     echo -e "  ${BOLD}==================================================${NC}"
-    echo ""
 
     if (( ${#comprometidas_emails[@]} > 0 )); then
-        echo -e "  ${RED}Cuentas comprometidas:${NC}"
-        for email in "${comprometidas_emails[@]}"; do
-            echo "    - $email"
+        echo ""
+        echo -e "  ${RED}═══ Cuentas comprometidas ═══${NC}"
+        for entry in "${comprometidas_emails[@]}"; do
+            IFS=':' read -r email pass count <<< "$entry"
+            printf "  ${RED}⚠${NC} %-35s : ${YELLOW}%-20.20s${NC}  ${RED}(filtrada %s veces)${NC}\n" "$email" "$pass" "$count"
         done
         echo ""
     fi
