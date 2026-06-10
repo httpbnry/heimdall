@@ -43,17 +43,36 @@ PSA_SQLITE_PATHS=(
 )
 
 
-# Intenta extraer email y password de una línea
+# Intenta extraer email y password de una línea (formato pipe table)
 parse_mail_line() {
     local line="$1" email password
-    # Formato email:password (regex estricto)
-    if [[ "$line" =~ ^([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):(.+)$ ]]; then
-        email="${BASH_REMATCH[1]}"
-        password="${BASH_REMATCH[2]}"
-        [[ -n "$password" ]] && { echo "$email|$password"; return 0; }
+    line="${line#"${line%%[![:space:]]*}"}"  # trim leading
+    line="${line%"${line##*[![:space:]]}"}"   # trim trailing
+
+    # Saltar cabeceras: guiones, address, flags
+    [[ -z "$line" || "$line" == "-"* ]] && return 1
+    [[ "$line" == *"address"* || "$line" == *"flags"* ]] && return 1
+
+    # Formato tabla con pipes: | email | flags | password |
+    if [[ "$line" == *"|"* ]]; then
+        local IFS='|'
+        local -a parts=($line)
+        unset IFS
+        # Limpiar espacios
+        local cleaned=()
+        for p in "${parts[@]}"; do
+            p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+            [[ -n "$p" ]] && cleaned+=("$p")
+        done
+        if [[ "${#cleaned[@]}" -ge 3 && "${cleaned[0]}" == *@* ]]; then
+            email="${cleaned[0]}"
+            password="${cleaned[2]}"
+            [[ -n "$password" ]] && { echo "$email|$password"; return 0; }
+        fi
     fi
-    # Formato email[whitespace]password
-    if [[ "$line" =~ ^([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})[[:space:]]+([^[:space:]]+)$ ]]; then
+
+    # Formato email:password
+    if [[ "$line" =~ ^([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):(.+)$ ]]; then
         email="${BASH_REMATCH[1]}"
         password="${BASH_REMATCH[2]}"
         [[ -n "$password" ]] && { echo "$email|$password"; return 0; }

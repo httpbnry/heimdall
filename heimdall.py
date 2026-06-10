@@ -32,6 +32,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 ENV_PATH = SCRIPT_DIR / ".env"
 
 # Formatos de mail_auth_view
+LINE_RE_PIPE  = re.compile(r"^\|\s*([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\s*\|\s*[^|]*\|\s*(.+?)\s*\|?\s*$")
 LINE_RE_COLON = re.compile(r"^([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}):(.+)$")
 LINE_RE_WS   = re.compile(r"^([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\s+(\S+)$")
 
@@ -70,25 +71,34 @@ def _db_password() -> str:
 
 
 def _parse_mail_line(line: str) -> tuple[str, str] | None:
-    """Intenta extraer email y password de una línea en varios formatos."""
-    m = LINE_RE_COLON.match(line)
+    """Intenta extraer email y password de mail_auth_view (formato pipe table)."""
+    line_stripped = line.strip()
+    # Saltar líneas de cabecera: guiones, "address", "flags", "password"
+    if not line_stripped or line_stripped.startswith("-") or \
+       "address" in line_stripped.lower() or \
+       (line_stripped.count("|") > 0 and "flags" in line_stripped.lower()):
+        return None
+    # Formato tabla con pipes: | email | flags | password |
+    if "|" in line_stripped:
+        parts = [p.strip() for p in line_stripped.split("|")]
+        parts = [p for p in parts if p]  # quitar vacíos
+        if len(parts) >= 3 and "@" in parts[0]:
+            email, password = parts[0], parts[2]
+            logging.debug("Parsed [pipe] -> email=%s pass=%s", email, password[:20])
+            return email, password
+    # Formato email:password
+    m = LINE_RE_COLON.match(line_stripped)
     if m:
         email, password = m.group(1), m.group(2)
         logging.debug("Parsed [colon] -> email=%s pass=%s", email, password[:20])
         return email, password
-    m = LINE_RE_WS.match(line)
+    # Formato email[whitespace]password
+    m = LINE_RE_WS.match(line_stripped)
     if m:
         email, password = m.group(1), m.group(2)
         logging.debug("Parsed [space] -> email=%s pass=%s", email, password[:20])
         return email, password
-    # Fallback: split por whitespace, buscar campo con @
-    parts = line.split()
-    for i, p in enumerate(parts):
-        if "@" in p and i + 1 < len(parts):
-            email, password = p, parts[i + 1]
-            logging.debug("Parsed [fallback] -> email=%s pass=%s", email, password[:20])
-            return email, password
-    logging.debug("No parseable: %s", line[:80])
+    logging.debug("No parseable: %s", line_stripped[:80])
     return None
 
 
