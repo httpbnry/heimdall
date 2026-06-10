@@ -58,15 +58,18 @@ parse_mail_line() {
         local IFS='|'
         local -a parts=($line)
         unset IFS
-        # Buscar email y password por posición en las columnas
-        local idx email_part pass_part
+        # Recortar todas las partes primero
+        local idx
         for idx in "${!parts[@]}"; do
             p="${parts[$idx]}"
             p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
             parts[$idx]="$p"
-            if [[ "$p" == *@* ]]; then
-                email_part="$p"
-                # password está 2 columnas después (email | flags | password)
+        done
+        # Buscar email y password por posición
+        local email_part pass_part
+        for idx in "${!parts[@]}"; do
+            if [[ "${parts[$idx]}" == *@* ]]; then
+                email_part="${parts[$idx]}"
                 pass_idx=$(( idx + 2 ))
                 if [[ $pass_idx -lt ${#parts[@]} ]]; then
                     pass_part="${parts[$pass_idx]}"
@@ -263,7 +266,7 @@ main() {
 
         for i in "${!emails[@]}"; do
             s="${suffixes[$i]}"; e="${emails[$i]}"
-            match=$(echo "$buf" | grep -i "^${s}:" | head -1)
+            match=$(echo "$buf" | grep -i "^${s}:" | head -1) || true
             if [[ -n "$match" ]]; then
                 count="${match#*:}"
                 count="${count%%[[:space:]]*}"
