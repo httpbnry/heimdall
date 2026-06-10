@@ -234,7 +234,7 @@ main() {
 
         # Mostrar cada cuenta de este prefijo
         echo ""
-        echo -e "  ${BOLD}-- [{prefix_count}/${total_prefixes}] Prefijo ${prefix} (${#emails[@]} pwd)${NC}"
+        echo -e "  ${BOLD}-- [${prefix_count}/${total_prefixes}] Prefijo ${prefix} (${#emails[@]} pwd)${NC}"
         for i in "${!emails[@]}"; do
             e="${emails[$i]}"
             echo "    ${e}"
@@ -252,19 +252,16 @@ main() {
         fi
         echo -e "${GREEN}OK${NC}"
 
-        unset __cmap 2>/dev/null || true; declare -A __cmap
-        while IFS=: read -r s c; do
-            s=$(echo "$s" | tr 'a-f' 'A-F' | xargs)
-            __cmap["$s"]="$c"
-        done <<< "$buf"
-
         for i in "${!emails[@]}"; do
             s="${suffixes[$i]}"; e="${emails[$i]}"
-            if [[ -n "${__cmap[$s]:-}" ]]; then
-                echo "COMPROMISED|${e}|${prefix}${s}|${__cmap[$s]}" >> "$report_file"
+            match=$(echo "$buf" | grep -i "^${s}:" | head -1)
+            if [[ -n "$match" ]]; then
+                count="${match#*:}"
+                count="${count%%[[:space:]]*}"
+                echo "COMPROMISED|${e}|${prefix}${s}|${count}" >> "$report_file"
                 comp=$(( comp + 1 ))
                 comprometidas_emails+=("$e")
-                echo -e "    ${RED}⚠ COMPROMETIDA: ${e} (filtrada ${__cmap[$s]}x)${NC}"
+                echo -e "    ${RED}⚠ COMPROMETIDA: ${e} (filtrada ${count}x)${NC}"
             else
                 echo "SAFE|${e}|${prefix}${s}|0" >> "$report_file"
             fi
