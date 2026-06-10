@@ -453,25 +453,25 @@ def run_audit(cfg: dict, txt_output: str = "",
     total_prefijos = len(prefix_to_hashes)
     duplicados = total_cuentas - total_unicas
 
-    print(f"  Cuentas: {COLOR_BOLD}{total_cuentas}{COLOR_RESET} | "
-          f"Únicas: {COLOR_BOLD}{total_unicas}{COLOR_RESET} | "
-          f"Prefijos: {COLOR_BOLD}{total_prefijos}{COLOR_RESET} | "
-          f"Ahorro: {COLOR_GREEN}{duplicados + (total_unicas - total_prefijos)} llamadas{COLOR_RESET}\n")
+    ahorro = duplicados + (total_unicas - total_prefijos)
+    print(f"  {COLOR_BOLD}{total_cuentas}{COLOR_RESET} cuentas · "
+          f"{COLOR_BOLD}{total_unicas}{COLOR_RESET} únicas · "
+          f"{COLOR_BOLD}{total_prefijos}{COLOR_RESET} prefijos · "
+          f"{COLOR_GREEN}{ahorro}{COLOR_RESET} llamadas ahorradas\n")
 
     stats = {"comprometidas": 0, "errores": 0}
     reporte = []
+    comprometidas_list: list[str] = []
 
     for idx, (prefix, suffix_list) in enumerate(prefix_to_hashes.items(), 1):
-        print(f"  [{idx}/{total_prefijos}] Prefijo {prefix} "
-              f"({len(suffix_list)} pwd) ... ", end="", flush=True)
+        print(f"  [{idx}/{total_prefijos}] {prefix} ", end="", flush=True)
 
         time.sleep(cfg["hibp_rate_limit"])
 
         try:
             suffixes = fetch_hibp_suffixes(prefix)
-            print(f"{COLOR_GREEN}OK{COLOR_RESET} ({len(suffixes)} hashes)")
         except RuntimeError as e:
-            print(f"{COLOR_RED}ERROR{COLOR_RESET}")
+            print(f"{COLOR_RED}ERR{COLOR_RESET}")
             logging.error("Fallo prefijo %s: %s", prefix, e)
             for _, full_hash in suffix_list:
                 for acct in hash_to_accounts[full_hash]:
@@ -480,10 +480,14 @@ def run_audit(cfg: dict, txt_output: str = "",
                                     "comprometida": False, "ocurrencias": 0, "error": str(e)})
             continue
 
+        # Buscar comprometidas en este prefijo
+        encontradas = 0
         for suffix, full_hash in suffix_list:
             if suffix in suffixes:
+                encontradas += len(hash_to_accounts[full_hash])
                 for acct in hash_to_accounts[full_hash]:
                     stats["comprometidas"] += 1
+                    comprometidas_list.append(acct["email"])
                     reporte.append({"email": acct["email"], "hash": full_hash,
                                     "comprometida": True,
                                     "ocurrencias": suffixes[suffix], "error": None})
@@ -492,17 +496,25 @@ def run_audit(cfg: dict, txt_output: str = "",
                     reporte.append({"email": acct["email"], "hash": full_hash,
                                     "comprometida": False, "ocurrencias": 0, "error": None})
 
+        if encontradas:
+            print(f"{COLOR_RED}{encontradas} comprometida(s){COLOR_RESET}")
+        else:
+            print(f"{COLOR_GREEN}OK{COLOR_RESET}")
+
     seguras = total_cuentas - stats["comprometidas"] - stats["errores"]
-    ahorro_total = duplicados + (total_unicas - total_prefijos)
-    print(f"\n{'=' * 50}")
-    print(f"  Cuentas        : {total_cuentas}")
-    print(f"  Únicas         : {total_unicas}")
-    print(f"  Prefijos API   : {total_prefijos}")
-    print(f"  Llamadas API   : {total_prefijos} (ahorro: {COLOR_GREEN}{ahorro_total}{COLOR_RESET})")
-    print(f"  Seguras        : {COLOR_GREEN}{seguras}{COLOR_RESET}")
-    print(f"  Comprometidas  : {COLOR_RED}{stats['comprometidas']}{COLOR_RESET}")
-    print(f"  Errores        : {COLOR_YELLOW}{stats['errores']}{COLOR_RESET}")
-    print(f"{'=' * 50}\n")
+    print(f"\n  {'=' * 48}")
+    print(f"  Total     : {total_cuentas}")
+    print(f"  Seguras   : {COLOR_GREEN}{seguras}{COLOR_RESET}")
+    print(f"  {"Comprometidas"}  : {COLOR_RED}{stats['comprometidas']}{COLOR_RESET}")
+    print(f"  Errores   : {COLOR_YELLOW}{stats['errores']}{COLOR_RESET}")
+    print(f"  Ahorro    : {COLOR_GREEN}{ahorro} llamadas API{COLOR_RESET}")
+    print(f"  {'=' * 48}\n")
+
+    if comprometidas_list:
+        print(f"  {COLOR_RED}Cuentas comprometidas:{COLOR_RESET}")
+        for email in comprometidas_list:
+            print(f"    - {email}")
+        print("")
 
     if txt_output:
         _guardar_reporte(reporte, txt_output)

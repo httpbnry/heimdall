@@ -206,70 +206,83 @@ main() {
     # Agrupar por prefijo
     total_prefixes=$(cut -d'|' -f1 "$dedup_file" | sort -u | wc -l)
 
-    echo -e "  Cuentas: ${BOLD}${total}${NC} | Únicas: ${BOLD}${unicas}${NC} | Prefijos: ${BOLD}${total_prefixes}${NC} | Ahorro: ${GREEN}$(( duplicados + (unicas - total_prefixes) )) llamadas${NC}"
+    local ahorro=$(( duplicados + (unicas - total_prefixes) ))
+    echo -e "  ${BOLD}${total}${NC} cuentas · ${BOLD}${unicas}${NC} únicas · ${BOLD}${total_prefixes}${NC} prefijos · ${GREEN}${ahorro}${NC} llamadas ahorradas"
     echo ""
 
     # Fase 2: agrupar por prefijo y procesar cada grupo
     prefix_count=0
+    local -a comprometidas_emails=()
     while IFS= read -r prefix; do
         [[ -z "$prefix" ]] && continue
         prefix_count=$(( prefix_count + 1 ))
 
-        # Obtener entradas de este prefijo
         local entries buf
         entries=$(grep "^${prefix}|" "$dedup_file" || true)
 
-        # Arrays locales
         local -a emails=() suffixes=()
         while IFS='|' read -r _ s e; do
             suffixes+=("$s"); emails+=("$e")
         done <<< "$entries"
         [[ "${#emails[@]}" -eq 0 ]] && continue
 
-        printf "  [%d/%d] Prefijo %s (%d pwd) ... " \
-               "$prefix_count" "$total_prefixes" "$prefix" "${#suffixes[@]}"
+        printf "  [%d/%d] %s " "$prefix_count" "$total_prefixes" "$prefix"
 
         buf=$(fetch_prefix "$prefix") || true
         if [[ -z "$buf" ]]; then
-            echo -e "${RED}ERROR${NC}"
+            echo -e "${RED}ERR${NC}"
             for i in "${!emails[@]}"; do
                 echo "ERROR|${emails[$i]}|${prefix}${suffixes[$i]}" >> "$report_file"
                 errs=$(( errs + 1 ))
             done
             continue
         fi
-        echo -e "${GREEN}OK${NC}"
 
-        # Construir mapa de sufijos (global dentro de main)
         unset __cmap 2>/dev/null || true; declare -A __cmap
         while IFS=: read -r s c; do
             s=$(echo "$s" | tr 'a-f' 'A-F' | xargs)
             __cmap["$s"]="$c"
         done <<< "$buf"
 
+        local encontradas=0
         for i in "${!emails[@]}"; do
             s="${suffixes[$i]}"; e="${emails[$i]}"
             if [[ -n "${__cmap[$s]:-}" ]]; then
                 echo "COMPROMISED|${e}|${prefix}${s}|${__cmap[$s]}" >> "$report_file"
                 comp=$(( comp + 1 ))
+                comprometidas_emails+=("$e")
+                encontradas=$(( encontradas + 1 ))
             else
                 echo "SAFE|${e}|${prefix}${s}|0" >> "$report_file"
             fi
         done
+
+        if (( encontradas > 0 )); then
+            echo -e "${RED}${encontradas} comprometida(s)${NC}"
+        else
+            echo -e "${GREEN}OK${NC}"
+        fi
     done < <(cut -d'|' -f1 "$dedup_file" | sort -u)
 
     # Resumen
     safe=$(( total - comp - errs ))
     echo ""
     echo -e "  ${BOLD}==================================================${NC}"
-    echo -e "   Cuentas        : ${total}"
-    echo -e "   Únicas         : ${unicas}"
-    echo -e "   Prefijos API   : ${total_prefixes}  (ahorro: ${GREEN}$(( duplicados + (unicas - total_prefixes) ))${NC})"
-    echo -e "   Seguras        : ${GREEN}${safe}${NC}"
-    echo -e "   Comprometidas  : ${RED}${comp}${NC}"
-    echo -e "   Errores        : ${YELLOW}${errs}${NC}"
+    echo -e "  Total     : ${total}"
+    echo -e "  Seguras   : ${GREEN}${safe}${NC}"
+    echo -e "  Comprometidas : ${RED}${comp}${NC}"
+    echo -e "  Errores   : ${YELLOW}${errs}${NC}"
+    echo -e "  Ahorro    : ${GREEN}${ahorro} llamadas API${NC}"
     echo -e "  ${BOLD}==================================================${NC}"
     echo ""
+
+    if (( ${#comprometidas_emails[@]} > 0 )); then
+        echo -e "  ${RED}Cuentas comprometidas:${NC}"
+        for email in "${comprometidas_emails[@]}"; do
+            echo "    - $email"
+        done
+        echo ""
+    fi
 
     # Reporte .txt
     if [[ -n "$txt_output" ]]; then
