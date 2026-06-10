@@ -232,17 +232,25 @@ main() {
         done <<< "$entries"
         [[ "${#emails[@]}" -eq 0 ]] && continue
 
-        printf "  [%d/%d] %s " "$prefix_count" "$total_prefixes" "$prefix"
+        # Mostrar cada cuenta de este prefijo
+        echo ""
+        echo -e "  ${BOLD}-- [{prefix_count}/${total_prefixes}] Prefijo ${prefix} (${#emails[@]} pwd)${NC}"
+        for i in "${!emails[@]}"; do
+            e="${emails[$i]}"
+            echo "    ${e}"
+        done
+        printf "    Consultando HIBP ... "
 
         buf=$(fetch_prefix "$prefix") || true
         if [[ -z "$buf" ]]; then
-            echo -e "${RED}ERR${NC}"
+            echo -e "${RED}ERROR${NC}"
             for i in "${!emails[@]}"; do
                 echo "ERROR|${emails[$i]}|${prefix}${suffixes[$i]}" >> "$report_file"
                 errs=$(( errs + 1 ))
             done
             continue
         fi
+        echo -e "${GREEN}OK${NC}"
 
         unset __cmap 2>/dev/null || true; declare -A __cmap
         while IFS=: read -r s c; do
@@ -250,24 +258,18 @@ main() {
             __cmap["$s"]="$c"
         done <<< "$buf"
 
-        local encontradas=0
         for i in "${!emails[@]}"; do
             s="${suffixes[$i]}"; e="${emails[$i]}"
             if [[ -n "${__cmap[$s]:-}" ]]; then
                 echo "COMPROMISED|${e}|${prefix}${s}|${__cmap[$s]}" >> "$report_file"
                 comp=$(( comp + 1 ))
                 comprometidas_emails+=("$e")
-                encontradas=$(( encontradas + 1 ))
+                echo -e "    ${RED}⚠ COMPROMETIDA: ${e} (filtrada ${__cmap[$s]}x)${NC}"
             else
                 echo "SAFE|${e}|${prefix}${s}|0" >> "$report_file"
             fi
         done
-
-        if (( encontradas > 0 )); then
-            echo -e "${RED}${encontradas} comprometida(s)${NC}"
-        else
-            echo -e "${GREEN}OK${NC}"
-        fi
+        echo ""
     done < <(cut -d'|' -f1 "$dedup_file" | sort -u)
 
     # Resumen

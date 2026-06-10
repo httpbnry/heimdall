@@ -355,7 +355,7 @@ def _extract_from_file(ruta: str) -> list[dict]:
             if password:
                 accounts.append({"email": email, "password": password})
         else:
-            logging.warning("Línea ignorada: %s", line[:80])
+            logging.debug("Línea ignorada: %s", line[:80])
     logging.info("Backend file: %d cuentas desde %s", len(accounts), ruta)
     return accounts
 
@@ -479,14 +479,23 @@ def run_audit(cfg: dict, txt_output: str = "",
     comprometidas_list: list[str] = []
 
     for idx, (prefix, suffix_list) in enumerate(prefix_to_hashes.items(), 1):
-        print(f"  [{idx}/{total_prefijos}] {prefix} ", end="", flush=True)
+        # Mostrar cada cuenta de este prefijo antes de consultar HIBP
+        print(f"\n  {'─' * 50}")
+        print(f"  [{idx}/{total_prefijos}] Prefijo {prefix} ({len(suffix_list)} pwd{'s' if len(suffix_list)>1 else ''})")
+        for _, full_hash in suffix_list:
+            for acct in hash_to_accounts[full_hash]:
+                pwd_preview = acct["password"][:20]
+                print(f"    {acct['email']:<40} {COLOR_YELLOW}{pwd_preview}{'..' if len(acct['password'])>20 else ''}{COLOR_RESET}")
+        print(f"    {'─' * 50}")
+        print(f"    Consultando HIBP ... ", end="", flush=True)
 
         time.sleep(cfg["hibp_rate_limit"])
 
         try:
             suffixes = fetch_hibp_suffixes(prefix)
+            print(f"{COLOR_GREEN}OK{COLOR_RESET}")
         except RuntimeError as e:
-            print(f"{COLOR_RED}ERR{COLOR_RESET}")
+            print(f"{COLOR_RED}ERROR{COLOR_RESET}")
             logging.error("Fallo prefijo %s: %s", prefix, e)
             for _, full_hash in suffix_list:
                 for acct in hash_to_accounts[full_hash]:
@@ -495,26 +504,20 @@ def run_audit(cfg: dict, txt_output: str = "",
                                     "comprometida": False, "ocurrencias": 0, "error": str(e)})
             continue
 
-        # Buscar comprometidas en este prefijo
-        encontradas = 0
         for suffix, full_hash in suffix_list:
             if suffix in suffixes:
-                encontradas += len(hash_to_accounts[full_hash])
                 for acct in hash_to_accounts[full_hash]:
                     stats["comprometidas"] += 1
                     comprometidas_list.append(acct["email"])
                     reporte.append({"email": acct["email"], "hash": full_hash,
                                     "comprometida": True,
                                     "ocurrencias": suffixes[suffix], "error": None})
+                    print(f"    {COLOR_RED}⚠ COMPROMETIDA: {acct['email']} (filtrada {suffixes[suffix]}x){COLOR_RESET}")
             else:
                 for acct in hash_to_accounts[full_hash]:
                     reporte.append({"email": acct["email"], "hash": full_hash,
                                     "comprometida": False, "ocurrencias": 0, "error": None})
-
-        if encontradas:
-            print(f"{COLOR_RED}{encontradas} comprometida(s){COLOR_RESET}")
-        else:
-            print(f"{COLOR_GREEN}OK{COLOR_RESET}")
+        print()
 
     seguras = total_cuentas - stats["comprometidas"] - stats["errores"]
     print(f"\n  {'=' * 48}")
